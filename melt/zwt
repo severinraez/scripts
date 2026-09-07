@@ -5,6 +5,7 @@
 #
 #   zwt                  in a worktree: every repo, and its path under the current worktree
 #                        anywhere else: every worktree name there is
+#   zwt paths            only the paths of that listing, space separated
 #   zwt WORKTREE REPO    path of worktrees/REPO/WORKTREE/REPO
 #   zwt REPO             the same, for the worktree the cwd is in
 #
@@ -44,12 +45,31 @@ repos() { ls -1 "$share/worktrees" 2>/dev/null; }
 
 worktree_path() { printf '%s/worktrees/%s/%s/%s\n' "$share" "$2" "$1" "$2"; }
 
+# Every repo's copy of the given worktree that exists, one per line.
+existing_paths() {
+  local repo path
+  while read -r repo; do
+    path=$(worktree_path "$1" "$repo")
+    [[ -d $path ]] && printf '%s\n' "$path"
+  done < <(repos)
+}
+
 case ${1:-} in -h | --help) usage; exit 0 ;; esac
 [[ $# -gt 2 ]] && die "too many arguments; see zwt --help"
 
 share=$(share_root) || die "no worktrees/ at or above $PWD — set ZWT_ROOT"
 [[ -d $share/worktrees ]] || die "$share/worktrees does not exist"
 worktree=$(current_worktree)
+
+# The listing without the repo names, on one line, to hand to something else — Zed opening a
+# whole set, say. A repo of that name is shadowed: reach it with 'zwt WORKTREE paths'.
+if [[ ${1:-} == paths ]]; then
+  [[ $# -eq 1 ]] || die "zwt paths takes no arguments"
+  [[ -n $worktree ]] || die "not in a worktree — no paths to print"
+  mapfile -t found < <(existing_paths "$worktree")
+  printf '%s\n' "${found[*]-}"
+  exit 0
+fi
 
 if [[ $# -eq 0 ]]; then
   # In a worktree: the repos, and where each one's copy of this worktree lives. A repo that

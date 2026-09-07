@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# zwt — get around the worktree layout: <share>/worktrees/<repo>/<worktree>/<repo>, one repo
+# apart, the way Zed makes them. A <worktree> name spans repos, so the worktrees sharing one
+# are the group you work on together; this prints their paths so you can cd to them.
+#
+#   zwt                  in a worktree: every repo, and its path under the current worktree
+#                        anywhere else: every worktree name there is
+#   zwt WORKTREE REPO    path of worktrees/REPO/WORKTREE/REPO
+#   zwt REPO             the same, for the worktree the cwd is in
+#
+# Set ZWT_ROOT to the share to use it from outside the layout; otherwise the share is the
+# nearest directory at or above the cwd that holds a worktrees/.
+
+set -uo pipefail
+
+die() { printf 'zwt: %s\n' "$1" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
+
+# The share the layout hangs off, walking up from the cwd: the parent of a worktrees/ we are
+# standing inside, else the first ancestor that has one.
+share_root() {
+  [[ -n ${ZWT_ROOT:-} ]] && { printf '%s\n' "${ZWT_ROOT%/}"; return; }
+
+  local dir=$PWD
+  while [[ $dir != / ]]; do
+    [[ ${dir##*/} == worktrees ]] && { printf '%s\n' "${dir%/*}"; return; }
+    [[ -d $dir/worktrees ]] && { printf '%s\n' "$dir"; return; }
+    dir=${dir%/*}
+    [[ -z $dir ]] && dir=/
+  done
+  return 1
+}
+
+# The worktree the cwd is in, read off the path itself — empty outside the layout.
+current_worktree() {
+  local rel=${PWD#"$share/"}
+  [[ $rel == "$PWD" || $rel != worktrees/*/* ]] && return
+  rel=${rel#worktrees/*/}
+  printf '%s\n' "${rel%%/*}"
+}
+
+repos() { ls -1 "$share/worktrees" 2>/dev/null; }
+
+worktree_path() { printf '%s/worktrees/%s/%s/%s\n' "$share" "$2" "$1" "$2"; }
+
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+[[ $# -gt 2 ]] && die "too many arguments; see zwt --help"
+
+share=$(share_root) || die "no worktrees/ at or above $PWD — set ZWT_ROOT"
+[[ -d $share/worktrees ]] || die "$share/worktrees does not exist"
+worktree=$(current_worktree)
+
+if [[ $# -eq 0 ]]; then
+  # In a worktree: the repos, and where each one's copy of this worktree lives. A repo that
+  # has no worktree of that name is listed all the same, so you can see it is not in on it.
+  if [[ -n $worktree ]]; then
+    while read -r repo; do
+      path=$(worktree_path "$worktree" "$repo")
+      [[ -d $path ]] || path='-'
+      printf '%-20s %s\n' "$repo" "$path"
+    done < <(repos)
+  else
+    # Anywhere else there is no worktree to fix on, so just the names, each one once.
+    while read -r repo; do
+      ls -1 "$share/worktrees/$repo" 2>/dev/null
+    done < <(repos) | sort -u
+  fi
+  exit 0
+fi
+
+if [[ $# -eq 2 ]]; then
+  target=$(worktree_path "$1" "$2")
+else
+  [[ -n $worktree ]] || die "not in a worktree — say 'zwt WORKTREE $1'"
+  target=$(worktree_path "$worktree" "$1")
+fi
+
+[[ -d $target ]] || die "no such worktree: $target"
+printf '%s\n' "$target"

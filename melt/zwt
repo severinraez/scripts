@@ -3,11 +3,11 @@
 # apart, the way Zed makes them. A <worktree> name spans repos, so the worktrees sharing one
 # are the group you work on together; this prints their paths so you can cd to them.
 #
-#   zwt                  in a worktree: every repo, and its path under the current worktree
-#                        anywhere else: every worktree name there is
-#   zwt paths            only the paths of that listing, space separated
-#   zwt WORKTREE REPO    path of worktrees/REPO/WORKTREE/REPO
-#   zwt REPO             the same, for the worktree the cwd is in
+#   zwt                    in a worktree: every repo, and its path under the current worktree
+#                          anywhere else: every worktree name there is
+#   zwt paths [WORKTREE]   only the paths of that listing, space separated
+#   zwt WORKTREE REPO      path of worktrees/REPO/WORKTREE/REPO
+#   zwt REPO               the same, for the worktree the cwd is in
 #
 # Set ZWT_ROOT to the share to use it from outside the layout; otherwise the share is the
 # nearest directory at or above the cwd that holds a worktrees/.
@@ -62,12 +62,14 @@ share=$(share_root) || die "no worktrees/ at or above $PWD — set ZWT_ROOT"
 worktree=$(current_worktree)
 
 # The listing without the repo names, on one line, to hand to something else — Zed opening a
-# whole set, say. A repo of that name is shadowed: reach it with 'zwt WORKTREE paths'.
+# whole set, say. Names a worktree of its own, so it reaches one you are not standing in. A
+# repo called paths is shadowed: reach that with 'zwt WORKTREE paths'.
 if [[ ${1:-} == paths ]]; then
-  [[ $# -eq 1 ]] || die "zwt paths takes no arguments"
-  [[ -n $worktree ]] || die "not in a worktree — no paths to print"
-  mapfile -t found < <(existing_paths "$worktree")
-  printf '%s\n' "${found[*]-}"
+  wanted=${2:-$worktree}
+  [[ -n $wanted ]] || die "not in a worktree — say 'zwt paths WORKTREE'"
+  mapfile -t found < <(existing_paths "$wanted")
+  [[ ${#found[@]} -gt 0 ]] || die "no worktree named $wanted"
+  printf '%s\n' "${found[*]}"
   exit 0
 fi
 

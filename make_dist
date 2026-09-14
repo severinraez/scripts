@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# make_dist — rebuild dist/, a sibling of general/. It gets one directory per profile (every
+# top-level dir here except general and dist itself, so melt and grem), each filled with
+# symlinks to every script in general/ plus that profile's own — a profile's script overrides
+# general's of the same name. Put dist/<profile> on PATH to use it.
+
+set -uo pipefail
+
+die() { printf 'make_dist: %s\n' "$1" >&2; exit 1; }
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || die "can't locate script"
+general=$root/general
+dist=$root/dist
+
+[[ -d $general ]] || die "no $general"
+
+rm -rf "$dist" || die "can't remove $dist"
+mkdir -p "$dist" || die "can't create $dist"
+
+for profile_dir in "$root"/*/; do
+  profile=${profile_dir%/}
+  profile=${profile##*/}
+  [[ $profile == general || $profile == dist ]] && continue
+
+  out=$dist/$profile
+  mkdir -p "$out" || die "can't create $out"
+
+  for f in "$general"/* "$root/$profile"/*; do
+    [[ -f $f ]] || continue
+    ln -sf "$f" "$out/${f##*/}" || die "can't link $f"
+  done
+done

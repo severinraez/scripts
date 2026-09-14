@@ -6,6 +6,7 @@
 #   zwt                    in a worktree: every repo, and its path under the current worktree
 #                          anywhere else: every worktree name there is
 #   zwt paths [WORKTREE]   only the paths of that listing, space separated
+#   zwt worktrees          every worktree, the repos in on it, and what each has checked out
 #   zwt WORKTREE REPO      path of worktrees/REPO/WORKTREE/REPO
 #   zwt REPO               the same, for the worktree the cwd is in
 #
@@ -54,6 +55,25 @@ existing_paths() {
   done < <(repos)
 }
 
+# Every worktree name in the share, each one once however many repos have it.
+worktree_names() {
+  local repo
+  while read -r repo; do
+    ls -1 "$share/worktrees/$repo" 2>/dev/null
+  done < <(repos) | sort -u
+}
+
+# What the checkout at the given path has on HEAD: the branch it is on, the commit it sits on
+# detached, or '-' when git will not tell us — no checkout there, or not a repo at all.
+head_state() {
+  local head
+  head=$(git -C "$1" symbolic-ref --short HEAD 2>/dev/null) &&
+    { printf '%s\n' "$head"; return; }
+  head=$(git -C "$1" rev-parse --short HEAD 2>/dev/null) &&
+    { printf 'detached %s\n' "$head"; return; }
+  printf -- '-\n'
+}
+
 case ${1:-} in -h | --help) usage; exit 0 ;; esac
 [[ $# -gt 2 ]] && die "too many arguments; see zwt --help"
 
@@ -73,6 +93,21 @@ if [[ ${1:-} == paths ]]; then
   exit 0
 fi
 
+# The whole share at a glance: each worktree, and under it the repos that are in on it with
+# what they have checked out. A repo without a copy of the worktree is left out — here the
+# point is what the set you would work on actually is. A repo called worktrees is shadowed:
+# reach that with 'zwt WORKTREE worktrees'.
+if [[ ${1:-} == worktrees ]]; then
+  [[ $# -eq 1 ]] || die "worktrees takes no arguments; see zwt --help"
+  while read -r name; do
+    printf '%s\n' "$name"
+    while read -r path; do
+      printf '  %-18s %s\n' "${path##*/}" "$(head_state "$path")"
+    done < <(existing_paths "$name")
+  done < <(worktree_names)
+  exit 0
+fi
+
 if [[ $# -eq 0 ]]; then
   # In a worktree: the repos, and where each one's copy of this worktree lives. A repo that
   # has no worktree of that name is listed all the same, so you can see it is not in on it.
@@ -84,9 +119,7 @@ if [[ $# -eq 0 ]]; then
     done < <(repos)
   else
     # Anywhere else there is no worktree to fix on, so just the names, each one once.
-    while read -r repo; do
-      ls -1 "$share/worktrees/$repo" 2>/dev/null
-    done < <(repos) | sort -u
+    worktree_names
   fi
   exit 0
 fi

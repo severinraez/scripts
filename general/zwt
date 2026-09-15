@@ -3,12 +3,14 @@
 # apart, the way Zed makes them. A <worktree> name spans repos, so the worktrees sharing one
 # are the group you work on together; this prints their paths so you can cd to them.
 #
-#   zwt                    in a worktree: every repo, and its path under the current worktree
-#                          anywhere else: every worktree name there is
-#   zwt paths [WORKTREE]   only the paths of that listing, space separated
-#   zwt worktrees          every worktree, the repos in on it, and what each has checked out
-#   zwt WORKTREE REPO      path of worktrees/REPO/WORKTREE/REPO
-#   zwt REPO               the same, for the worktree the cwd is in
+#   zwt                             in a worktree: every repo, and its path under the current
+#                                   worktree; anywhere else: every worktree name there is
+#   zwt paths [WORKTREE]            only the paths of that listing, space separated
+#   zwt worktrees                   every worktree, its repos, and what each has checked out
+#   zwt update-detached [WORKTREE]  the repos there sitting detached: fetch, then detach again
+#                                   on origin/main
+#   zwt WORKTREE REPO               path of worktrees/REPO/WORKTREE/REPO
+#   zwt REPO                        the same, for the worktree the cwd is in
 #
 # Set ZWT_ROOT to the share to use it from outside the layout; otherwise the share is the
 # nearest directory at or above the cwd that holds a worktrees/.
@@ -106,6 +108,45 @@ if [[ ${1:-} == worktrees ]]; then
     done < <(existing_paths "$name")
   done < <(worktree_names)
   exit 0
+fi
+
+# Catch the repos of a set up with origin/main again. Only the ones sitting on a detached
+# commit are touched — a repo on a branch is work in the middle of, so it is left alone and
+# said so. A repo called update-detached is shadowed: reach that with
+# 'zwt WORKTREE update-detached'.
+if [[ ${1:-} == update-detached ]]; then
+  wanted=${2:-$worktree}
+  [[ -n $wanted ]] || die "not in a worktree — say 'zwt update-detached WORKTREE'"
+  mapfile -t found < <(existing_paths "$wanted")
+  [[ ${#found[@]} -gt 0 ]] || die "no worktree named $wanted"
+
+  status=0
+  for path in "${found[@]}"; do
+    repo=${path##*/}
+    state=$(head_state "$path")
+    if [[ $state != detached\ * ]]; then
+      printf '%-18s left alone, on %s\n' "$repo" "$state"
+      continue
+    fi
+
+    if ! git -C "$path" fetch --quiet origin; then
+      printf '%-18s fetch failed\n' "$repo"
+      status=1
+      continue
+    fi
+    if ! head=$(git -C "$path" rev-parse --short --verify origin/main 2>/dev/null); then
+      printf '%-18s no origin/main\n' "$repo"
+      status=1
+      continue
+    fi
+    if ! git -C "$path" checkout --quiet --detach origin/main; then
+      printf '%-18s checkout failed\n' "$repo"
+      status=1
+      continue
+    fi
+    printf '%-18s %s -> %s\n' "$repo" "${state#detached }" "$head"
+  done
+  exit $status
 fi
 
 if [[ $# -eq 0 ]]; then

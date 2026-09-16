@@ -1,0 +1,476 @@
+#!/usr/bin/env ruby
+# wt — get around the worktree layout <worktree_root>/<tree>/<repo>: a tree is one name that
+# spans every repository, so the checkouts under it are the set you work on together. Every
+# repo in a fresh tree sits detached on origin/main, the way work starts before a branch.
+#
+#   wt                              in a tree: that tree, its repos, and what each has
+#                                   checked out; anywhere else: every tree, the same way
+#   wt list                      l  every tree name
+#   wt list-repos               lr  every tree, its repos, and what each has checked out
+#   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
+#                                   path of every tree, one per line
+#   wt repo-paths [TREE]        rp  the repos of a tree, space separated on one line, to
+#                                   hand to something else
+#   wt add TREE                  a  make TREE, every repo in it detached on origin/main
+#   wt update [TREE]             u  cut the worktrees a tree is missing; with no TREE, every
+#                                   tree there is
+#   wt update-detached [TREE]   ud  the repos there sitting detached: fetch, then detach
+#                                   again on origin/main. --all for every tree
+#   wt remove TREE [--force]    rm  take TREE and the worktrees in it away
+#   wt config                    c  the .wt.yml in force, verbatim
+#   wt init                      i  write a .wt.yml here, with the shape filled in
+#
+# The config is the first .wt.yml at or above the cwd, looking no higher than $HOME:
+#
+#   worktree_root: ~/trees
+#   repositories:
+#     repo-1: ~/dev/repo-1
+#     repo-2: ~/dev/repo-2
+#
+# repositories maps the directory name a repo gets inside a tree to the working copy its
+# worktrees are cut from. Paths are ~-expanded, and a relative one is read off the config's
+# own directory. A repo that never renamed its default branch is taken from origin/master
+# where origin/main is what everything else uses.
+
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'open3'
+require 'yaml'
+
+$stdout.sync = true
+
+Config = Struct.new(:path, :root, :repos)
+
+ALIASES = {
+  'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
+  'u' => 'update', 'ud' => 'update-detached', 'rm' => 'remove', 'c' => 'config',
+  'i' => 'init', 'rp' => 'repo-paths'
+}.freeze
+
+COMMANDS = %w[list list-repos path repo-paths add update update-detached remove config
+              init].freeze
+
+def die(message)
+  warn "wt: #{message}"
+  exit 1
+end
+
+def usage
+  File.readlines(__FILE__).drop(1).take_while { |line| line.start_with?('#') }
+                                  .each do |line|
+    puts line.sub(
+      /\A# ?/, ''
+    ).rstrip
+  end
+end
+
+# --- the config ------------------------------------------------------------------------
+
+# The nearest .wt.yml, walking up from the cwd. $HOME is as far as the walk goes: a config
+# above it would be one shared with every other user of the machine, which is not a thing.
+def load_config
+  dir = File.realpath(Dir.pwd)
+  home = File.expand_path('~')
+  loop do
+    candidate = File.join(dir, '.wt.yml')
+    return read_config(candidate) if File.file?(candidate)
+
+    parent = File.dirname(dir)
+    break if dir == home || parent == dir
+
+    dir = parent
+  end
+  die "no .wt.yml at or above #{Dir.pwd}"
+end
+
+def read_config(path)
+  data = begin
+    YAML.safe_load_file(path) || {}
+  rescue StandardError => e
+    die "#{path}: #{e.message}"
+  end
+  die "#{path}: not a mapping" unless data.is_a?(Hash)
+
+  root = data['worktree_root'].to_s
+  die "#{path}: no worktree_root" if root.empty?
+
+  repos = data['repositories']
+  die "#{path}: no repositories" unless repos.is_a?(Hash) && !repos.empty?
+
+  base = File.dirname(path)
+  Config.new(path, resolve(root, base), repos.to_h { |name, repo| [name.to_s, resolve(repo, base)] })
+end
+
+def resolve(path, base)
+  path = path.to_s
+  path.start_with?('~', '/') ? File.expand_path(path) : File.expand_path(path, base)
+end
+
+# --- git -------------------------------------------------------------------------------
+
+# Output and whether it worked, both at once — nothing here wants the two apart, and git
+# says what went wrong on stderr.
+def git(dir, *args)
+  out, status = Open3.capture2e('git', '-C', dir, *args)
+  [out.strip, status.success?]
+rescue SystemCallError => e
+  [e.message, false]
+end
+
+# What the checkout at the given path has on HEAD: the branch it is on, the commit it sits
+# on detached, or '-' when git will not tell us — not a checkout, or not a repo at all.
+def head_state(path)
+  return 'missing' unless Dir.exist?(path)
+
+  head, ok = git(path, 'symbolic-ref', '--short', 'HEAD')
+  return head if ok
+
+  head, ok = git(path, 'rev-parse', '--short', 'HEAD')
+  ok ? "detached #{head}" : '-'
+end
+
+# The ref a detached checkout hangs off. origin/main is what everything uses; a repo that
+# never renamed its default branch still has origin/master, so take that instead.
+def default_ref(dir)
+  %w[origin/main origin/master].find { |ref| git(dir, 'rev-parse', '--verify', '--quiet', ref).last }
+end
+
+# One fetch per repository per run, however many worktrees of it we walk over — they all
+# share the one object store, so a second fetch would be for nothing.
+def fetch_once(dir, done)
+  common, ok = git(dir, 'rev-parse', '--git-common-dir')
+  key = ok ? File.expand_path(common, dir) : dir
+  return done[key] if done.key?(key)
+
+  done[key] = git(dir, 'fetch', '--quiet', 'origin').last
+end
+
+# --- the layout ------------------------------------------------------------------------
+
+def trees(config)
+  return [] unless Dir.exist?(config.root)
+
+  Dir.children(config.root).select { |name| Dir.exist?(File.join(config.root, name)) }.sort
+end
+
+# The tree the cwd is in, read off the path itself — nil outside the layout.
+def current_tree(config)
+  root = File.realpath(config.root)
+  pwd = File.realpath(Dir.pwd)
+  return nil unless pwd.start_with?("#{root}/")
+
+  pwd.delete_prefix("#{root}/").split('/').first
+rescue SystemCallError
+  nil
+end
+
+# The repos of a tree: the configured ones in the order the config gives them, then whatever
+# else is sitting in there — a directory nobody configured is still yours to know about.
+def repo_entries(config, tree)
+  dir = File.join(config.root, tree)
+  present = Dir.exist?(dir) ? Dir.children(dir).select { |c| Dir.exist?(File.join(dir, c)) } : []
+  (config.repos.keys + (present - config.repos.keys).sort).map { |name| [name, File.join(dir, name)] }
+end
+
+def require_tree(config, tree)
+  die "no tree named #{tree}" unless Dir.exist?(File.join(config.root, tree))
+
+  tree
+end
+
+# The trees a command that can mean one of them, or all, is aimed at.
+def targets(config, tree, all, verb)
+  die 'say a tree or --all, not both' if tree && all
+  return every_tree(config) if all
+  return [require_tree(config, tree)] if tree
+
+  here = current_tree(config)
+  die "not in a tree — say 'wt #{verb} TREE' or --all" unless here
+
+  [here]
+end
+
+def every_tree(config)
+  trees(config).tap { |list| die "no trees under #{config.root}" if list.empty? }
+end
+
+# --- saying what happened ----------------------------------------------------------------
+
+def print_notes(notes, indent: '')
+  width = notes.map { |name, _| name.length }.max || 0
+  notes.each { |name, note| puts "#{indent}#{name.ljust(width)}  #{note}" }
+end
+
+def print_tree(config, tree)
+  puts tree
+  print_notes(repo_entries(config, tree).map { |name, path| [name, head_state(path)] }, indent: '  ')
+end
+
+# Walk the trees a command is aimed at, printing what each had to say. A tree's name goes
+# above its lines only when there is more than one tree to tell them apart.
+def report_trees(list)
+  list.each do |tree|
+    notes = yield tree
+    next if notes.empty?
+
+    puts tree if list.size > 1
+    print_notes(notes, indent: list.size > 1 ? '  ' : '')
+  end
+end
+
+# --- one repo at a time --------------------------------------------------------------------
+
+# Cut one worktree, detached where the repo's default branch is.
+def cut_worktree(source, path, fetched)
+  return ["no repository at #{source}", false] unless git(source, 'rev-parse', '--git-dir').last
+  return ['fetch failed', false] unless fetch_once(source, fetched)
+
+  ref = default_ref(source)
+  return ['no origin/main or origin/master', false] unless ref
+
+  head, = git(source, 'rev-parse', '--short', ref)
+  out, ok = git(source, 'worktree', 'add', '--detach', path, ref)
+  return ["worktree add failed: #{out.lines.last&.strip}", false] unless ok
+
+  ["detached #{head}", true]
+end
+
+# Catch one checkout up with origin. Only a repo sitting on a detached commit is touched — a
+# repo on a branch is work in the middle of, so it is left alone and said so.
+def redetach(path, fetched)
+  state = head_state(path)
+  return ["left alone, on #{state}", true] unless state.start_with?('detached ')
+  return ['fetch failed', false] unless fetch_once(path, fetched)
+
+  ref = default_ref(path)
+  return ['no origin/main or origin/master', false] unless ref
+
+  head, = git(path, 'rev-parse', '--short', ref)
+  out, ok = git(path, 'checkout', '--quiet', '--detach', ref)
+  return ["checkout failed: #{out.lines.last&.strip}", false] unless ok
+
+  was = state.delete_prefix('detached ')
+  [was == head ? "already on #{head}" : "#{was} -> #{head}", true]
+end
+
+# Take one worktree away. git refuses one with work in it, which is the point — that refusal
+# is all that stands between a stray 'wt rm' and an afternoon. --force overrules it, and
+# takes down a directory git will not own to at all.
+def drop_worktree(source, path, force)
+  args = %w[worktree remove]
+  args << '--force' if force
+  out, ok = git(source, *args, path)
+  return ['removed', true] if ok
+
+  unless force
+    return [head_state(path) == '-' ? 'not a worktree' : out.lines.last&.strip || 'remove failed', false]
+  end
+
+  FileUtils.rm_rf(path)
+  git(source, 'worktree', 'prune')
+  ['removed by force', true]
+end
+
+# --- commands --------------------------------------------------------------------------
+
+# Cut the worktrees a tree does not have yet. Reports a line per repo worth saying something
+# about — with report_existing, that is every repo; without it, only what changed or broke.
+def fill_tree(config, tree, fetched, report_existing:)
+  notes = []
+  failed = false
+
+  config.repos.each do |name, source|
+    path = File.join(config.root, tree, name)
+    if Dir.exist?(path)
+      notes << [name, head_state(path)] if report_existing
+      next
+    end
+
+    note, ok = cut_worktree(source, path, fetched)
+    failed ||= !ok
+    notes << [name, note]
+  end
+
+  [notes, failed]
+end
+
+def cmd_add(config, args)
+  die 'add takes one tree name; see wt --help' unless args.size == 1
+
+  tree = args.first
+  die 'a tree name is one directory name, not a path' if tree.include?('/')
+
+  FileUtils.mkdir_p(File.join(config.root, tree))
+  notes, failed = fill_tree(config, tree, {}, report_existing: true)
+  print_notes(notes)
+  exit 1 if failed
+end
+
+def cmd_update(config, args, all)
+  die 'update takes at most one tree name; see wt --help' if args.size > 1
+  die 'say a tree or --all, not both' if args.first && all
+
+  list = args.first ? [require_tree(config, args.first)] : every_tree(config)
+  fetched = {}
+  failed = false
+
+  report_trees(list) do |tree|
+    notes, broke = fill_tree(config, tree, fetched, report_existing: false)
+    failed ||= broke
+    notes
+  end
+  exit 1 if failed
+end
+
+def cmd_update_detached(config, args, all)
+  die 'update-detached takes at most one tree name; see wt --help' if args.size > 1
+
+  list = targets(config, args.first, all, 'update-detached')
+  fetched = {}
+  failed = false
+
+  report_trees(list) do |tree|
+    repo_entries(config, tree).filter_map do |name, path|
+      next unless Dir.exist?(path)
+
+      note, ok = redetach(path, fetched)
+      failed ||= !ok
+      [name, note]
+    end
+  end
+  exit 1 if failed
+end
+
+def cmd_remove(config, args, force)
+  die 'remove takes one tree name; see wt --help' unless args.size == 1
+
+  tree = require_tree(config, args.first)
+  tree_dir = File.join(config.root, tree)
+  failed = false
+
+  notes = repo_entries(config, tree).filter_map do |name, path|
+    next unless Dir.exist?(path)
+
+    note, ok = drop_worktree(config.repos[name] || path, path, force)
+    failed ||= !ok
+    [name, note]
+  end
+  print_notes(notes)
+
+  die "#{tree_dir} left in place" if failed
+
+  drop_tree_dir(tree_dir, force)
+  puts "removed #{tree_dir}"
+end
+
+def drop_tree_dir(tree_dir, force)
+  return FileUtils.rm_rf(tree_dir) if force
+  return Dir.rmdir(tree_dir) if Dir.empty?(tree_dir)
+
+  die "#{tree_dir} is not empty — clear it yourself, or say --force"
+end
+
+TEMPLATE = <<~YML
+  # .wt.yml — what wt goes by. The nearest one at or above the directory you are in wins.
+
+  # Where the trees live: every tree is a directory in here, and every repo is a directory
+  # in that. wt add makes them; nothing else needs to.
+  worktree_root: ~/trees
+
+  # The directory name a repo gets inside a tree, and the working copy its worktrees are
+  # cut from. Paths are ~-expanded, and a relative one is read off this file's own
+  # directory. A fresh worktree comes up detached on origin/main, or origin/master where
+  # that is the repo's default branch.
+  repositories:
+    repo-1: ~/dev/repo-1
+    repo-2: ~/dev/repo-2
+YML
+
+# Lay down a config to fill in. Nothing is guessed from what is lying around: which repos
+# belong together is the one thing only you know.
+def cmd_init(args)
+  die 'init takes no arguments; see wt --help' unless args.empty?
+
+  path = File.join(Dir.pwd, '.wt.yml')
+  die "#{path} is already there" if File.exist?(path)
+
+  File.write(path, TEMPLATE)
+  puts "wrote #{path}"
+end
+
+def cmd_path(config, args)
+  die 'path takes a tree and a repo at most; see wt --help' if args.size > 2
+
+  return trees(config).each { |tree| puts File.join(config.root, tree) } if args.empty?
+  return puts File.join(config.root, require_tree(config, args.first)) if args.size == 1
+
+  path = File.join(config.root, args[0], args[1])
+  die "no such worktree: #{path}" unless Dir.exist?(path)
+
+  puts path
+end
+
+# The repos of a tree on one line, space separated, for something else to take in one go —
+# an editor opening the whole set, say. Only the ones actually there are named.
+def cmd_repo_paths(config, args)
+  die 'repo-paths takes at most one tree name; see wt --help' if args.size > 1
+
+  tree = args.first ? require_tree(config, args.first) : current_tree(config)
+  die "not in a tree — say 'wt repo-paths TREE'" unless tree
+
+  paths = repo_entries(config, tree).filter_map { |_, path| path if Dir.exist?(path) }
+  die "no repos in #{tree}" if paths.empty?
+
+  puts paths.join(' ')
+end
+
+def cmd_default(config, args)
+  die 'too many arguments; see wt --help' unless args.empty?
+
+  here = current_tree(config)
+  return print_tree(config, here) if here
+
+  trees(config).each { |tree| print_tree(config, tree) }
+end
+
+# --- dispatch --------------------------------------------------------------------------
+
+argv = ARGV.dup
+if argv.include?('-h') || argv.include?('--help')
+  usage
+  exit 0
+end
+
+flags, args = argv.partition { |arg| arg.start_with?('-') }
+unknown = flags - %w[--all --force]
+die "unknown option: #{unknown.first}; see wt --help" unless unknown.empty?
+
+all = flags.include?('--all')
+force = flags.include?('--force')
+
+command = args.shift
+command = ALIASES.fetch(command, command)
+die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
+die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
+die '--force is for remove' if force && command != 'remove'
+
+if command == 'init'
+  cmd_init(args)
+  exit 0
+end
+
+config = load_config
+
+case command
+when nil then cmd_default(config, args)
+when 'list' then trees(config).each { |tree| puts tree }
+when 'list-repos' then trees(config).each { |tree| print_tree(config, tree) }
+when 'path' then cmd_path(config, args)
+when 'repo-paths' then cmd_repo_paths(config, args)
+when 'add' then cmd_add(config, args)
+when 'update' then cmd_update(config, args, all)
+when 'update-detached' then cmd_update_detached(config, args, all)
+when 'remove' then cmd_remove(config, args, force)
+when 'config' then print File.read(config.path)
+end

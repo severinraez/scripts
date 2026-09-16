@@ -1,0 +1,19 @@
+# Ruby scripts here are single-file commands: a method per command, each walking the repos
+# and saying what it did. Cutting those into ten-line pieces would hide the shape, so the
+# metrics are loosened to what these scripts actually are — everything else stays default.
+
+AllCops:
+  TargetRubyVersion: 3.1
+  NewCops: enable
+
+Metrics/AbcSize:
+  Max: 25
+
+Metrics/CyclomaticComplexity:
+  Max: 10
+
+Metrics/MethodLength:
+  Max: 15
+
+Metrics/PerceivedComplexity:
+  Max: 10

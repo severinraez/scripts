@@ -10,8 +10,9 @@
 # tree it is instead of naming whichever repo came first. wt leaves dot directories out of its
 # listings, so .zed-markers is not mistaken for a tree.
 #
-#   zed-open-wts [DIR]   every tree there is, reverse of the order wt lists them, so the
-#                        first tree by name is the last window opened
+#   zed-open-wts [DIR]              every tree there is, in reverse natural order, so the
+#                                   first tree by name is the last window opened
+#   zed-open-wts [DIR] --add TREE   just TREE, into the Zed already holding the others
 #
 # DIR is the worktree directory the trees live in, ~/dev/trees say; wt runs there, so that is
 # also where it looks for its config — the first .wt.yml at or above it. Left out, DIR is the
@@ -23,10 +24,27 @@ die() { printf 'zed-open-wts: %s\n' "$1" >&2; exit 1; }
 
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
-case ${1:-} in -h | --help) usage; exit 0 ;; esac
-[[ $# -le 1 ]] || die "takes at most one directory; see zed-open-wts --help"
+dir=
+add=
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+    --add)
+      [[ -n ${2:-} ]] || die "--add wants a tree name; see zed-open-wts --help"
+      [[ -z $add ]] || die "one --add at a time"
+      add=$2
+      shift 2
+      ;;
+    -*) die "unknown option: $1; see zed-open-wts --help" ;;
+    *)
+      [[ -z $dir ]] || die "takes at most one directory; see zed-open-wts --help"
+      dir=$1
+      shift
+      ;;
+  esac
+done
 
-dir=${1:-$PWD}
+dir=${dir:-$PWD}
 [[ -d $dir ]] || die "no such directory: $dir"
 cd "$dir" || die "can't enter $dir"
 
@@ -35,7 +53,19 @@ command -v zed >/dev/null || die "zed is not on PATH"
 
 listing=$(wt list) || die "wt list failed in $dir"
 [[ -n $listing ]] || die "no trees under $dir"
-mapfile -t trees < <(sort -r <<<"$listing")
+
+# --add names the one tree to open, and it goes to an already running Zed the way every tree
+# but the first does — the others are in there, this one joins them.
+if [[ -n $add ]]; then
+  grep -qxF "$add" <<<"$listing" || die "no tree named $add under $dir"
+  trees=("$add")
+  attach=1
+else
+  # Natural order, so tree-9 comes before tree-10 rather than after it — then reversed, so
+  # the tree named first is the window opened last.
+  mapfile -t trees < <(sort -rV <<<"$listing")
+  attach=0
+fi
 
 # The empty folder that gives a tree's window its name. It sits beside the trees, under the
 # root wt puts them in, which is the parent of any one tree's path.
@@ -67,9 +97,9 @@ for tree in "${trees[@]}"; do
     continue
   fi
 
-  # The first tree is the one allowed to bring Zed up; the rest ask for the window it opened,
-  # so a run of this ends with one Zed holding every tree rather than one Zed per tree.
-  if (( first )); then
+  # The first tree of a whole run is the one allowed to bring Zed up; the rest ask for the
+  # window it opened, so a run ends with one Zed holding every tree rather than one per tree.
+  if (( first && !attach )); then
     zed "$marker" "${paths[@]}"
   else
     zed -e "$marker" "${paths[@]}"

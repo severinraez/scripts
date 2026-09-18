@@ -148,10 +148,15 @@ end
 
 # --- the layout ------------------------------------------------------------------------
 
+# The trees under the root: its directories, minus the ones whose name starts with a dot —
+# a .zed-markers or the like is bookkeeping somebody keeps beside the trees, not one of them.
 def trees(config)
   return [] unless Dir.exist?(config.root)
 
-  Dir.children(config.root).select { |name| Dir.exist?(File.join(config.root, name)) }.sort
+  Dir.children(config.root)
+     .reject { |name| name.start_with?('.') }
+     .select { |name| Dir.exist?(File.join(config.root, name)) }
+     .sort
 end
 
 # The tree the cwd is in, read off the path itself — nil outside the layout.

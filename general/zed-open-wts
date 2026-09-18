@@ -5,7 +5,13 @@
 # plain 'zed', which starts Zed when it is not up yet; every tree after it goes to 'zed -e',
 # landing in the Zed now running instead of starting another.
 #
-#   zed-open-wts [DIR]   every tree there is, in the order wt lists them
+# Ahead of the repos each window gets one more folder, <root>/.zed-markers/<tree>, made here
+# if it is not there yet: an empty directory named after the tree, so the window says which
+# tree it is instead of naming whichever repo came first. wt leaves dot directories out of its
+# listings, so .zed-markers is not mistaken for a tree.
+#
+#   zed-open-wts [DIR]   every tree there is, reverse of the order wt lists them, so the
+#                        first tree by name is the last window opened
 #
 # DIR is the worktree directory the trees live in, ~/dev/trees say; wt runs there, so that is
 # also where it looks for its config — the first .wt.yml at or above it. Left out, DIR is the
@@ -29,7 +35,15 @@ command -v zed >/dev/null || die "zed is not on PATH"
 
 listing=$(wt list) || die "wt list failed in $dir"
 [[ -n $listing ]] || die "no trees under $dir"
-mapfile -t trees <<<"$listing"
+mapfile -t trees < <(sort -r <<<"$listing")
+
+# The empty folder that gives a tree's window its name. It sits beside the trees, under the
+# root wt puts them in, which is the parent of any one tree's path.
+marker_dir() {
+  local tree_path
+  tree_path=$(wt path "$1") || return 1
+  printf '%s/.zed-markers/%s\n' "${tree_path%/*}" "$1"
+}
 
 status=0
 first=1
@@ -47,12 +61,18 @@ for tree in "${trees[@]}"; do
     continue
   fi
 
+  if ! marker=$(marker_dir "$tree") || ! mkdir -p "$marker"; then
+    printf '%-20s no marker folder\n' "$tree"
+    status=1
+    continue
+  fi
+
   # The first tree is the one allowed to bring Zed up; the rest ask for the window it opened,
   # so a run of this ends with one Zed holding every tree rather than one Zed per tree.
   if (( first )); then
-    zed -n "${paths[@]}"
+    zed "$marker" "${paths[@]}"
   else
-    zed -e "${paths[@]}"
+    zed -e "$marker" "${paths[@]}"
   fi
   ok=$?
 

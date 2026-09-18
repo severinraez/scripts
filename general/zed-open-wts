@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # zed-open-wts — open every tree under a worktree root in Zed, one window per tree. The trees
 # come from 'wt list' and a tree's repos from 'wt repo-paths TREE', so the set wt calls a tree
-# is the set that lands in one window, all its repos side by side. The first tree goes to a
-# plain 'zed', which starts Zed when it is not up yet; every tree after it goes to 'zed -e',
-# landing in the Zed now running instead of starting another.
+# is the set that lands in one window, all its repos side by side. Zed is brought up first on
+# the main working copies, 'wt main-repo-paths', so the repos themselves get the window the app
+# opens with; every tree then goes to 'zed -e', landing in that Zed rather than starting
+# another.
 #
-# Ahead of the repos each window gets one more folder, <root>/.zed-markers/<tree>, made here
-# if it is not there yet: an empty directory named after the tree, so the window says which
-# tree it is instead of naming whichever repo came first. wt leaves dot directories out of its
-# listings, so .zed-markers is not mistaken for a tree.
+# Ahead of the repos each tree's window gets one more folder, <root>/.zed-markers/<tree>, made
+# here if it is not there yet: an empty directory named after the tree, so the window says
+# which tree it is instead of naming whichever repo came first. wt leaves dot directories out
+# of its listings, so .zed-markers is not mistaken for a tree.
 #
-#   zed-open-wts [DIR]              every tree there is, in reverse natural order, so the
-#                                   first tree by name is the last window opened
+#   zed-open-wts [DIR]              the main repos, then every tree there is, in reverse
+#                                   natural order, so the first tree by name is the last
+#                                   window opened
 #   zed-open-wts [DIR] --add TREE   just TREE, into the Zed already holding the others
 #
 # DIR is the worktree directory the trees live in, ~/dev/trees say; wt runs there, so that is
@@ -55,7 +57,7 @@ listing=$(wt list) || die "wt list failed in $dir"
 [[ -n $listing ]] || die "no trees under $dir"
 
 # --add names the one tree to open, and it goes to an already running Zed the way every tree
-# but the first does — the others are in there, this one joins them.
+# does — the others are in there, this one joins them.
 if [[ -n $add ]]; then
   grep -qxF "$add" <<<"$listing" || die "no tree named $add under $dir"
   trees=("$add")
@@ -75,8 +77,16 @@ marker_dir() {
   printf '%s/.zed-markers/%s\n' "${tree_path%/*}" "$1"
 }
 
+# The window Zed comes up with: the main working copies, the checkouts the worktrees are cut
+# from. Only a whole run opens it — with --add that window is up already, along with the trees.
+if (( !attach )); then
+  main=$(wt main-repo-paths) || die "wt main-repo-paths failed in $dir"
+  read -r -a main_paths <<<"$main"
+  zed "${main_paths[@]}" || die "zed failed on the main repos"
+  printf '%-20s %d repos\n' '(main)' "${#main_paths[@]}"
+fi
+
 status=0
-first=1
 for tree in "${trees[@]}"; do
   if ! line=$(wt repo-paths "$tree"); then
     printf '%-20s repo-paths failed\n' "$tree"
@@ -97,23 +107,15 @@ for tree in "${trees[@]}"; do
     continue
   fi
 
-  # The first tree of a whole run is the one allowed to bring Zed up; the rest ask for the
-  # window it opened, so a run ends with one Zed holding every tree rather than one per tree.
-  if (( first && !attach )); then
-    zed "$marker" "${paths[@]}"
-  else
-    zed -e "$marker" "${paths[@]}"
-  fi
-  ok=$?
-
-  if (( ok != 0 )); then
+  # Every tree asks for the Zed already running — the main repos brought it up — so a run ends
+  # with one Zed holding all of them rather than one Zed per tree.
+  if ! zed -e "$marker" "${paths[@]}"; then
     printf '%-20s zed failed\n' "$tree"
     status=1
     continue
   fi
 
   printf '%-20s %d repos\n' "$tree" "${#paths[@]}"
-  first=0
 done
 
 exit $status

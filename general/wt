@@ -11,6 +11,8 @@
 #                                   path of every tree, one per line
 #   wt repo-paths [TREE]        rp  the repos of a tree, space separated on one line, to
 #                                   hand to something else
+#   wt main-repo-paths         mrp  the main working copies the worktrees are cut from,
+#                                   the same way
 #   wt add TREE                  a  make TREE, every repo in it detached on origin/main
 #   wt update [TREE]             u  cut the worktrees a tree is missing; with no TREE, every
 #                                   tree there is
@@ -45,11 +47,11 @@ Config = Struct.new(:path, :root, :repos)
 ALIASES = {
   'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
   'u' => 'update', 'ud' => 'update-detached', 'rm' => 'remove', 'c' => 'config',
-  'i' => 'init', 'rp' => 'repo-paths'
+  'i' => 'init', 'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
 }.freeze
 
-COMMANDS = %w[list list-repos path repo-paths add update update-detached remove config
-              init].freeze
+COMMANDS = %w[list list-repos path repo-paths main-repo-paths add update update-detached
+              remove config init].freeze
 
 def die(message)
   warn "wt: #{message}"
@@ -430,6 +432,18 @@ def cmd_repo_paths(config, args)
   puts paths.join(' ')
 end
 
+# The working copies the worktrees are cut from — the configured repositories themselves,
+# main working trees rather than any tree's. Same one line as repo-paths, and the same rule:
+# only the ones actually there are named.
+def cmd_main_repo_paths(config, args)
+  die 'main-repo-paths takes no arguments; see wt --help' unless args.empty?
+
+  paths = config.repos.values.select { |path| Dir.exist?(path) }
+  die 'none of the configured repositories are there' if paths.empty?
+
+  puts paths.join(' ')
+end
+
 def cmd_default(config, args)
   die 'too many arguments; see wt --help' unless args.empty?
 
@@ -473,6 +487,7 @@ when 'list' then trees(config).each { |tree| puts tree }
 when 'list-repos' then trees(config).each { |tree| print_tree(config, tree) }
 when 'path' then cmd_path(config, args)
 when 'repo-paths' then cmd_repo_paths(config, args)
+when 'main-repo-paths' then cmd_main_repo_paths(config, args)
 when 'add' then cmd_add(config, args)
 when 'update' then cmd_update(config, args, all)
 when 'update-detached' then cmd_update_detached(config, args, all)

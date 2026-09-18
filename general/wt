@@ -5,6 +5,7 @@
 #
 #   wt                              in a tree: that tree, its repos, and what each has
 #                                   checked out; anywhere else: every tree, the same way
+#   wt --name                       the name of the tree you are in, on its own
 #   wt list                      l  every tree name
 #   wt list-repos               lr  every tree, its repos, and what each has checked out
 #   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
@@ -444,6 +445,14 @@ def cmd_main_repo_paths(config, args)
   puts paths.join(' ')
 end
 
+# The tree the cwd is in and nothing else, for a prompt or a script to put the name to use.
+def cmd_name(config)
+  here = current_tree(config)
+  die 'not in a tree' unless here
+
+  puts here
+end
+
 def cmd_default(config, args)
   die 'too many arguments; see wt --help' unless args.empty?
 
@@ -462,17 +471,19 @@ if argv.include?('-h') || argv.include?('--help')
 end
 
 flags, args = argv.partition { |arg| arg.start_with?('-') }
-unknown = flags - %w[--all --force]
+unknown = flags - %w[--all --force --name]
 die "unknown option: #{unknown.first}; see wt --help" unless unknown.empty?
 
 all = flags.include?('--all')
 force = flags.include?('--force')
+name = flags.include?('--name')
 
 command = args.shift
 command = ALIASES.fetch(command, command)
 die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
 die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
 die '--force is for remove' if force && command != 'remove'
+die '--name goes on its own' if name && !(command.nil? && args.empty?)
 
 if command == 'init'
   cmd_init(args)
@@ -482,7 +493,7 @@ end
 config = load_config
 
 case command
-when nil then cmd_default(config, args)
+when nil then name ? cmd_name(config) : cmd_default(config, args)
 when 'list' then trees(config).each { |tree| puts tree }
 when 'list-repos' then trees(config).each { |tree| print_tree(config, tree) }
 when 'path' then cmd_path(config, args)

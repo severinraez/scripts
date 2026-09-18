@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# zed-open-wts — open every tree under a worktree root in Zed, one window per tree. The trees
+# come from 'wt list' and a tree's repos from 'wt repo-paths TREE', so the set wt calls a tree
+# is the set that lands in one window, all its repos side by side. The first tree goes to a
+# plain 'zed', which starts Zed when it is not up yet; every tree after it goes to 'zed -e',
+# landing in the Zed now running instead of starting another.
+#
+#   zed-open-wts [DIR]   every tree there is, in the order wt lists them
+#
+# DIR is the worktree directory the trees live in, ~/dev/trees say; wt runs there, so that is
+# also where it looks for its config — the first .wt.yml at or above it. Left out, DIR is the
+# cwd.
+
+set -uo pipefail
+
+die() { printf 'zed-open-wts: %s\n' "$1" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
+
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+[[ $# -le 1 ]] || die "takes at most one directory; see zed-open-wts --help"
+
+dir=${1:-$PWD}
+[[ -d $dir ]] || die "no such directory: $dir"
+cd "$dir" || die "can't enter $dir"
+
+command -v wt >/dev/null || die "wt is not on PATH"
+command -v zed >/dev/null || die "zed is not on PATH"
+
+listing=$(wt list) || die "wt list failed in $dir"
+[[ -n $listing ]] || die "no trees under $dir"
+mapfile -t trees <<<"$listing"
+
+status=0
+first=1
+for tree in "${trees[@]}"; do
+  if ! line=$(wt repo-paths "$tree"); then
+    printf '%-20s repo-paths failed\n' "$tree"
+    status=1
+    continue
+  fi
+
+  read -r -a paths <<<"$line"
+  if [[ ${#paths[@]} -eq 0 ]]; then
+    printf '%-20s no repos\n' "$tree"
+    status=1
+    continue
+  fi
+
+  # The first tree is the one allowed to bring Zed up; the rest ask for the window it opened,
+  # so a run of this ends with one Zed holding every tree rather than one Zed per tree.
+  if (( first )); then
+    zed -n "${paths[@]}"
+  else
+    zed -e "${paths[@]}"
+  fi
+  ok=$?
+
+  if (( ok != 0 )); then
+    printf '%-20s zed failed\n' "$tree"
+    status=1
+    continue
+  fi
+
+  printf '%-20s %d repos\n' "$tree" "${#paths[@]}"
+  first=0
+done
+
+exit $status

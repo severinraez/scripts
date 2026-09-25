@@ -23,6 +23,8 @@
 #                                   origin/main. One with uncommitted changes is left alone;
 #                                   --force throws the changes away. Branches stay as they are
 #   wt remove TREE [--force]    rm  take TREE and the worktrees in it away
+#   wt prune                    pr  in every repository, forget the worktrees whose
+#                                   directories are no longer there
 #   wt config                    c  the .wt.yml in force, verbatim
 #   wt init                      i  write a .wt.yml here, with the shape filled in
 #
@@ -50,12 +52,13 @@ Config = Struct.new(:path, :root, :repos)
 
 ALIASES = {
   'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
-  'u' => 'update', 'ud' => 'update-detached', 'rm' => 'remove', 'c' => 'config',
-  'i' => 'init', 'rp' => 'repo-paths', 'mrp' => 'main-repo-paths', 'rth' => 'reset-to-head'
+  'u' => 'update', 'ud' => 'update-detached', 'rth' => 'reset-to-head',
+  'rm' => 'remove', 'pr' => 'prune', 'c' => 'config', 'i' => 'init',
+  'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
 }.freeze
 
 COMMANDS = %w[list list-repos path repo-paths main-repo-paths add update update-detached
-              reset-to-head remove config init].freeze
+              reset-to-head remove prune config init].freeze
 
 def die(message)
   warn "wt: #{message}"
@@ -312,6 +315,19 @@ def drop_worktree(source, path, force)
   ['removed by force', true]
 end
 
+# Forget the worktrees of one repository whose directories are gone. git keeps a record per
+# worktree it cut, and a tree deleted by hand leaves that record behind, still holding on to
+# the branch it had checked out; pruning is what drops it.
+def prune_worktrees(source)
+  return ["no repository at #{source}", false] unless git(source, 'rev-parse', '--git-dir').last
+
+  out, ok = git(source, 'worktree', 'prune', '--verbose')
+  return ["prune failed: #{out.lines.last&.strip}", false] unless ok
+
+  gone = out.lines.count { |line| !line.strip.empty? }
+  [gone.zero? ? 'nothing stale' : "forgot #{gone}", true]
+end
+
 # --- commands --------------------------------------------------------------------------
 
 # Cut the worktrees a tree does not have yet. Reports a line per repo worth saying something
@@ -435,6 +451,22 @@ def drop_tree_dir(tree_dir, force)
   return Dir.rmdir(tree_dir) if Dir.empty?(tree_dir)
 
   die "#{tree_dir} is not empty — clear it yourself, or say --force"
+end
+
+# Prune every repository the config names. Nothing you still have is lost to it: a record
+# only goes when the directory it names is already gone, so this is the tidying up after
+# trees that were deleted by hand rather than with wt remove.
+def cmd_prune(config, args)
+  die 'prune takes no arguments; see wt --help' unless args.empty?
+
+  failed = false
+  notes = config.repos.map do |name, source|
+    note, ok = prune_worktrees(source)
+    failed ||= !ok
+    [name, note]
+  end
+  print_notes(notes)
+  exit 1 if failed
 end
 
 TEMPLATE = <<~YML
@@ -562,5 +594,6 @@ when 'update' then cmd_update(config, args, all)
 when 'update-detached' then cmd_update_detached(config, args, all)
 when 'reset-to-head' then cmd_reset_to_head(config, args, force)
 when 'remove' then cmd_remove(config, args, force)
+when 'prune' then cmd_prune(config, args)
 when 'config' then print File.read(config.path)
 end

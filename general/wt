@@ -19,6 +19,9 @@
 #                                   tree there is
 #   wt update-detached [TREE]   ud  the repos there sitting detached: fetch, then detach
 #                                   again on origin/main. --all for every tree
+#   wt reset-to-head [TREE]    rth  every repo there, branch or not: fetch, then detach on
+#                                   origin/main. One with uncommitted changes is left alone;
+#                                   --force throws the changes away. Branches stay as they are
 #   wt remove TREE [--force]    rm  take TREE and the worktrees in it away
 #   wt config                    c  the .wt.yml in force, verbatim
 #   wt init                      i  write a .wt.yml here, with the shape filled in
@@ -48,11 +51,11 @@ Config = Struct.new(:path, :root, :repos)
 ALIASES = {
   'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
   'u' => 'update', 'ud' => 'update-detached', 'rm' => 'remove', 'c' => 'config',
-  'i' => 'init', 'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
+  'i' => 'init', 'rp' => 'repo-paths', 'mrp' => 'main-repo-paths', 'rth' => 'reset-to-head'
 }.freeze
 
 COMMANDS = %w[list list-repos path repo-paths main-repo-paths add update update-detached
-              remove config init].freeze
+              reset-to-head remove config init].freeze
 
 def die(message)
   warn "wt: #{message}"
@@ -262,6 +265,30 @@ def redetach(path, fetched)
   [was == head ? "already on #{head}" : "#{was} -> #{head}", true]
 end
 
+# Put one checkout back on origin, whatever it had checked out. The branch it was on stays
+# where it is, commits and all — only the checkout moves off it. Uncommitted changes are
+# the one thing that would be lost, so a checkout with any is left alone unless forced.
+def reset_to_head(path, fetched, force)
+  state = head_state(path)
+  return ['not a checkout', false] if state == '-'
+
+  dirty, = git(path, 'status', '--porcelain', '--untracked-files=no')
+  return ["left alone, uncommitted changes on #{state}", false] unless dirty.empty? || force
+  return ['fetch failed', false] unless fetch_once(path, fetched)
+
+  ref = default_ref(path)
+  return ['no origin/main or origin/master', false] unless ref
+
+  head, = git(path, 'rev-parse', '--short', ref)
+  args = %w[checkout --quiet --detach]
+  args << '--force' if force
+  out, ok = git(path, *args, ref)
+  return ["checkout failed: #{out.lines.last&.strip}", false] unless ok
+
+  was = state.delete_prefix('detached ')
+  [was == head ? "already on #{head}" : "#{was} -> #{head}", true]
+end
+
 # Take one worktree away. git refuses one with work in it, which is the point — that refusal
 # is all that stands between a stray 'wt rm' and an afternoon. --force overrules it, and
 # takes down a directory git will not own to at all.
@@ -347,6 +374,25 @@ def cmd_update_detached(config, args, all)
       [name, note]
     end
   end
+  exit 1 if failed
+end
+
+def cmd_reset_to_head(config, args, force)
+  die 'reset-to-head takes at most one tree name; see wt --help' if args.size > 1
+
+  tree = args.first ? require_tree(config, args.first) : current_tree(config)
+  die "not in a tree — say 'wt reset-to-head TREE'" unless tree
+
+  fetched = {}
+  failed = false
+  notes = repo_entries(config, tree).filter_map do |name, path|
+    next unless Dir.exist?(path)
+
+    note, ok = reset_to_head(path, fetched, force)
+    failed ||= !ok
+    [name, note]
+  end
+  print_notes(notes)
   exit 1 if failed
 end
 
@@ -482,7 +528,7 @@ command = args.shift
 command = ALIASES.fetch(command, command)
 die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
 die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
-die '--force is for remove' if force && command != 'remove'
+die '--force is for remove and reset-to-head' if force && !%w[remove reset-to-head].include?(command)
 die '--name goes on its own' if name && !(command.nil? && args.empty?)
 
 if command == 'init'
@@ -502,6 +548,7 @@ when 'main-repo-paths' then cmd_main_repo_paths(config, args)
 when 'add' then cmd_add(config, args)
 when 'update' then cmd_update(config, args, all)
 when 'update-detached' then cmd_update_detached(config, args, all)
+when 'reset-to-head' then cmd_reset_to_head(config, args, force)
 when 'remove' then cmd_remove(config, args, force)
 when 'config' then print File.read(config.path)
 end

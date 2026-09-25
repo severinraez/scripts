@@ -155,14 +155,17 @@ end
 # --- the layout ------------------------------------------------------------------------
 
 # The trees under the root: its directories, minus the ones whose name starts with a dot —
-# a .zed-markers or the like is bookkeeping somebody keeps beside the trees, not one of them.
+# a dot directory is bookkeeping somebody keeps beside the trees, not one of them.
 def trees(config)
   return [] unless Dir.exist?(config.root)
 
-  Dir.children(config.root)
+  undotted_dirs(config.root).sort
+end
+
+def undotted_dirs(dir)
+  Dir.children(dir)
      .reject { |name| name.start_with?('.') }
-     .select { |name| Dir.exist?(File.join(config.root, name)) }
-     .sort
+     .select { |name| Dir.exist?(File.join(dir, name)) }
 end
 
 # The tree the cwd is in, read off the path itself — nil outside the layout.
@@ -178,9 +181,11 @@ end
 
 # The repos of a tree: the configured ones in the order the config gives them, then whatever
 # else is sitting in there — a directory nobody configured is still yours to know about.
+# Dot directories stay out of it, the same as among the trees: the .<tree> marker
+# zed-open-wts keeps in a tree is not a repo.
 def repo_entries(config, tree)
   dir = File.join(config.root, tree)
-  present = Dir.exist?(dir) ? Dir.children(dir).select { |c| Dir.exist?(File.join(dir, c)) } : []
+  present = Dir.exist?(dir) ? undotted_dirs(dir) : []
   (config.repos.keys + (present - config.repos.keys).sort).map { |name| [name, File.join(dir, name)] }
 end
 
@@ -418,8 +423,15 @@ def cmd_remove(config, args, force)
   puts "removed #{tree_dir}"
 end
 
+# Empty dot directories in the tree — the marker zed-open-wts leaves there — go without a
+# --force; there is nothing in them to lose.
 def drop_tree_dir(tree_dir, force)
   return FileUtils.rm_rf(tree_dir) if force
+
+  Dir.children(tree_dir).each do |name|
+    path = File.join(tree_dir, name)
+    Dir.rmdir(path) if name.start_with?('.') && Dir.exist?(path) && Dir.empty?(path)
+  end
   return Dir.rmdir(tree_dir) if Dir.empty?(tree_dir)
 
   die "#{tree_dir} is not empty — clear it yourself, or say --force"

@@ -6,10 +6,11 @@
 # opens with; every tree then goes to 'zed -e', landing in that Zed rather than starting
 # another.
 #
-# Ahead of the repos each tree's window gets one more folder, <root>/.zed-markers/<tree>, made
-# here if it is not there yet: an empty directory named after the tree, so the window says
-# which tree it is instead of naming whichever repo came first. wt leaves dot directories out
-# of its listings, so .zed-markers is not mistaken for a tree.
+# Ahead of the repos each tree's window gets one more folder, <root>/<tree>/.<tree>, made here
+# if it is not there yet: an empty directory named after the tree, so the window says which
+# tree it is instead of naming whichever repo came first. wt leaves dot directories out of its
+# listings, so the marker is not mistaken for a repo, and 'wt remove' takes it away with the
+# tree.
 #
 #   zed-open-wts [DIR]              the main repos, then every tree there is, in reverse
 #                                   natural order, so the first tree by name is the last
@@ -69,12 +70,12 @@ else
   attach=0
 fi
 
-# The empty folder that gives a tree's window its name. It sits beside the trees, under the
-# root wt puts them in, which is the parent of any one tree's path.
+# The empty folder that gives a tree's window its name. It sits in the tree itself, beside
+# its repos.
 marker_dir() {
   local tree_path
   tree_path=$(wt path "$1") || return 1
-  printf '%s/.zed-markers/%s\n' "${tree_path%/*}" "$1"
+  printf '%s/.%s\n' "$tree_path" "$1"
 }
 
 # The window Zed comes up with: the main working copies, the checkouts the worktrees are cut

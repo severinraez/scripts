@@ -1,0 +1,16 @@
+#!/bin/bash
+
+for dir in ~/skills ~/dotfiles ~/scripts; do
+    if [[ -d "$dir" ]]; then
+        cd "$dir"
+        pwd
+        git pull
+        cd -
+    fi
+done
+
+make_dist=~/scripts/make_dist
+if [[ -f "$make_dist" ]]; then
+    echo "Scripts: calling make_dist"
+    "$make_dist"
+fi

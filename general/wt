@@ -58,8 +58,7 @@ ALIASES = {
   'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
 }.freeze
 
-COMMANDS = %w[list list-repos path repo-paths main-repo-paths add update update-detached
-              reset-to-head remove prune config init].freeze
+COMMANDS = ALIASES.values.freeze
 
 def die(message)
   warn "wt: #{message}"
@@ -67,12 +66,8 @@ def die(message)
 end
 
 def usage
-  File.readlines(__FILE__).drop(1).take_while { |line| line.start_with?('#') }
-                                  .each do |line|
-    puts line.sub(
-      /\A# ?/, ''
-    ).rstrip
-  end
+  lines = File.readlines(__FILE__).drop(1).take_while { |line| line.start_with?('#') }
+  lines.each { |line| puts line.sub(/\A# ?/, '').rstrip }
 end
 
 # --- the config ------------------------------------------------------------------------
@@ -157,20 +152,41 @@ def work_state(path)
   parts.empty? ? 'clean' : parts.join(', ')
 end
 
-# The ref a detached checkout hangs off. origin/main is what everything uses; a repo that
-# never renamed its default branch still has origin/master, so take that instead.
+# The ref a detached checkout hangs off, and the commit it is on, short — nil when there is
+# neither. origin/main is what everything uses; a repo that never renamed its default branch
+# still has origin/master, so take that instead.
 def default_ref(dir)
-  %w[origin/main origin/master].find { |ref| git(dir, 'rev-parse', '--verify', '--quiet', ref).last }
+  %w[origin/main origin/master].each do |ref|
+    head, ok = git(dir, 'rev-parse', '--verify', '--quiet', '--short', ref)
+    return [ref, head] if ok
+  end
+  nil
 end
 
-# One fetch per repository per run, however many worktrees of it we walk over — they all
-# share the one object store, so a second fetch would be for nothing.
-def fetch_once(dir, done)
-  common, ok = git(dir, 'rev-parse', '--git-common-dir')
-  key = ok ? File.expand_path(common, dir) : dir
-  return done[key] if done.key?(key)
+def repo?(dir)
+  git(dir, 'rev-parse', '--git-dir').last
+end
 
-  done[key] = git(dir, 'fetch', '--quiet', 'origin').last
+# The last line of what git said, which is where it says what went wrong.
+def last_line(out)
+  out.lines.last&.strip
+end
+
+# The repository a checkout belongs to, named by the git dir all its worktrees share — two
+# checkouts with the same key fetch into the one object store.
+def repo_key(dir)
+  common, ok = git(dir, 'rev-parse', '--git-common-dir')
+  ok ? File.expand_path(common, dir) : dir
+end
+
+# Fetch the repositories the given checkouts belong to: once each, however many worktrees of
+# one there are — they share the one object store, so a second fetch would be for nothing —
+# and all at the same time, since a fetch is mostly waiting on the network. Whether it went
+# through, by checkout.
+def fetch_all(dirs)
+  repos = dirs.uniq.group_by { |dir| repo_key(dir) }.values
+  threads = repos.map { |group| Thread.new { git(group.first, 'fetch', '--quiet', 'origin').last } }
+  repos.zip(threads).flat_map { |group, thread| group.map { |dir| [dir, thread.value] } }.to_h
 end
 
 # --- the layout ------------------------------------------------------------------------
@@ -239,12 +255,20 @@ def print_notes(notes, indent: '')
   notes.each { |name, note| puts "#{indent}#{name.ljust(width)}  #{note}" }
 end
 
+# Each repo of the given trees, what it has checked out and whether it has work in it, by
+# tree. Every checkout is asked at the same time — they do not depend on one another, and a
+# git status on a big repo is worth not waiting out one after another.
+def tree_rows(config, list)
+  threads = list.to_h do |tree|
+    [tree, repo_entries(config, tree).map { |name, path| Thread.new { [name, head_state(path), work_state(path)] } }]
+  end
+  threads.transform_values { |repos| repos.map(&:value) }
+end
+
 # Each tree, its repos, what each has checked out and whether it has work in it. The columns
 # line up across all the trees printed, not just within one, so they read as one table.
 def print_trees(config, list)
-  rows = list.to_h do |tree|
-    [tree, repo_entries(config, tree).map { |name, path| [name, head_state(path), work_state(path)] }]
-  end
+  rows = tree_rows(config, list)
   all = rows.values.flatten(1)
   name_width = all.map { |name, _, _| name.length }.max || 0
   head_width = all.map { |_, head, _| head.length }.max || 0
@@ -254,72 +278,89 @@ def print_trees(config, list)
   end
 end
 
-# Walk the trees a command is aimed at, printing what each had to say. A tree's name goes
-# above its lines only when there is more than one tree to tell them apart.
-def report_trees(list)
-  list.each do |tree|
-    notes = yield tree
+# Print what a command had to say, by tree, and exit 1 if any of it went wrong. A tree's name
+# goes above its lines only when there is more than one tree to tell them apart.
+def report(results, failed)
+  results.each do |tree, notes|
     next if notes.empty?
 
-    puts tree if list.size > 1
-    print_notes(notes, indent: list.size > 1 ? '  ' : '')
+    puts tree if results.size > 1
+    print_notes(notes, indent: results.size > 1 ? '  ' : '')
   end
+  exit 1 if failed
 end
 
 # --- one repo at a time --------------------------------------------------------------------
 
+# Work that waits on a fetch: the checkout whose repository has to be fetched first, and
+# what to do once it has been.
+Pending = Struct.new(:dir, :work)
+
+# Do one thing to every repo of the given trees, in two passes. The block looks each repo
+# over and answers with its [note, ok] when that is all there is to it, nil when there is
+# nothing to say, or a Pending. Every repository a Pending names is then fetched in one go —
+# see fetch_all — and the work runs wherever its fetch went through. What came of it, by
+# tree as [name, note, ok], and whether anything failed.
+def across_repos(config, list)
+  plans = list.to_h { |tree| [tree, repo_entries(config, tree).map { |name, path| [name, yield(name, path)] }] }
+  fetched = fetch_all(plans.values.flatten(1).filter_map { |_, plan| plan.dir if plan.is_a?(Pending) })
+  results = plans.transform_values do |repos|
+    repos.filter_map { |name, plan| [name, *settle(plan, fetched)] if plan }
+  end
+  [results, results.values.flatten(1).any? { |_, _, ok| !ok }]
+end
+
+# A repo's [note, ok], doing the work a Pending is waiting on once its fetch is in.
+def settle(plan, fetched)
+  return plan unless plan.is_a?(Pending)
+
+  fetched[plan.dir] ? plan.work.call : ['fetch failed', false]
+end
+
 # Cut one worktree, detached where the repo's default branch is.
-def cut_worktree(source, path, fetched)
-  return ["no repository at #{source}", false] unless git(source, 'rev-parse', '--git-dir').last
-  return ['fetch failed', false] unless fetch_once(source, fetched)
+def cut_worktree(source, path)
+  return ["no repository at #{source}", false] unless repo?(source)
 
-  ref = default_ref(source)
-  return ['no origin/main or origin/master', false] unless ref
+  Pending.new(source, lambda do
+    ref, head = default_ref(source)
+    return ['no origin/main or origin/master', false] unless ref
 
-  head, = git(source, 'rev-parse', '--short', ref)
-  out, ok = git(source, 'worktree', 'add', '--detach', path, ref)
-  return ["worktree add failed: #{out.lines.last&.strip}", false] unless ok
-
-  ["detached #{head}", true]
+    out, ok = git(source, 'worktree', 'add', '--detach', path, ref)
+    ok ? ["detached #{head}", true] : ["worktree add failed: #{last_line(out)}", false]
+  end)
 end
 
 # Catch one checkout up with origin. Only a repo sitting on a detached commit is touched — a
 # repo on a branch is work in the middle of, so it is left alone and said so.
-def redetach(path, fetched)
+def redetach(path)
   state = head_state(path)
   return ["left alone, on #{state}", true] unless state.start_with?('detached ')
-  return ['fetch failed', false] unless fetch_once(path, fetched)
 
-  ref = default_ref(path)
-  return ['no origin/main or origin/master', false] unless ref
-
-  head, = git(path, 'rev-parse', '--short', ref)
-  out, ok = git(path, 'checkout', '--quiet', '--detach', ref)
-  return ["checkout failed: #{out.lines.last&.strip}", false] unless ok
-
-  was = state.delete_prefix('detached ')
-  [was == head ? "already on #{head}" : "#{was} -> #{head}", true]
+  Pending.new(path, -> { detach_on_default(path, state) })
 end
 
 # Put one checkout back on origin, whatever it had checked out. The branch it was on stays
 # where it is, commits and all — only the checkout moves off it. Uncommitted changes are
 # the one thing that would be lost, so a checkout with any is left alone unless forced.
-def reset_to_head(path, fetched, force)
+def reset_to_head(path, force)
   state = head_state(path)
   return ['not a checkout', false] if state == '-'
 
   dirty, = git(path, 'status', '--porcelain', '--untracked-files=no')
   return ["left alone, uncommitted changes on #{state}", false] unless dirty.empty? || force
-  return ['fetch failed', false] unless fetch_once(path, fetched)
 
-  ref = default_ref(path)
+  Pending.new(path, -> { detach_on_default(path, state, force:) })
+end
+
+# Detach a checkout on its repo's default ref, saying where it came from.
+def detach_on_default(path, state, force: false)
+  ref, head = default_ref(path)
   return ['no origin/main or origin/master', false] unless ref
 
-  head, = git(path, 'rev-parse', '--short', ref)
   args = %w[checkout --quiet --detach]
   args << '--force' if force
   out, ok = git(path, *args, ref)
-  return ["checkout failed: #{out.lines.last&.strip}", false] unless ok
+  return ["checkout failed: #{last_line(out)}", false] unless ok
 
   was = state.delete_prefix('detached ')
   [was == head ? "already on #{head}" : "#{was} -> #{head}", true]
@@ -333,10 +374,7 @@ def drop_worktree(source, path, force)
   args << '--force' if force
   out, ok = git(source, *args, path)
   return ['removed', true] if ok
-
-  unless force
-    return [head_state(path) == '-' ? 'not a worktree' : out.lines.last&.strip || 'remove failed', false]
-  end
+  return [head_state(path) == '-' ? 'not a worktree' : last_line(out) || 'remove failed', false] unless force
 
   FileUtils.rm_rf(path)
   git(source, 'worktree', 'prune')
@@ -347,10 +385,10 @@ end
 # worktree it cut, and a tree deleted by hand leaves that record behind, still holding on to
 # the branch it had checked out; pruning is what drops it.
 def prune_worktrees(source)
-  return ["no repository at #{source}", false] unless git(source, 'rev-parse', '--git-dir').last
+  return ["no repository at #{source}", false] unless repo?(source)
 
   out, ok = git(source, 'worktree', 'prune', '--verbose')
-  return ["prune failed: #{out.lines.last&.strip}", false] unless ok
+  return ["prune failed: #{last_line(out)}", false] unless ok
 
   gone = out.lines.count { |line| !line.strip.empty? }
   [gone.zero? ? 'nothing stale' : "forgot #{gone}", true]
@@ -358,25 +396,24 @@ end
 
 # --- commands --------------------------------------------------------------------------
 
-# Cut the worktrees a tree does not have yet. Reports a line per repo worth saying something
-# about — with report_existing, that is every repo; without it, only what changed or broke.
-def fill_tree(config, tree, fetched, report_existing:)
-  notes = []
-  failed = false
+# The worktrees of the given trees that are missing, cut. Reports a line per repo worth
+# saying something about — with report_existing, that is every configured repo; without it,
+# only what changed or broke.
+def fill_trees(config, list, report_existing:)
+  across_repos(config, list) do |name, path|
+    source = config.repos[name]
+    next unless source
+    next(report_existing ? [head_state(path), true] : nil) if Dir.exist?(path)
 
-  config.repos.each do |name, source|
-    path = File.join(config.root, tree, name)
-    if Dir.exist?(path)
-      notes << [name, head_state(path)] if report_existing
-      next
-    end
-
-    note, ok = cut_worktree(source, path, fetched)
-    failed ||= !ok
-    notes << [name, note]
+    cut_worktree(source, path)
   end
+end
 
-  [notes, failed]
+# The tree named, or else the one the cwd is in.
+def tree_or_here(config, tree, verb)
+  return require_tree(config, tree) if tree
+
+  current_tree(config) || die("not in a tree — say 'wt #{verb} TREE'")
 end
 
 def cmd_add(config, args)
@@ -386,9 +423,7 @@ def cmd_add(config, args)
   die 'a tree name is one directory name, not a path' if tree.include?('/')
 
   FileUtils.mkdir_p(File.join(config.root, tree))
-  notes, failed = fill_tree(config, tree, {}, report_existing: true)
-  print_notes(notes)
-  exit 1 if failed
+  report(*fill_trees(config, [tree], report_existing: true))
 end
 
 def cmd_update(config, args, all)
@@ -396,53 +431,21 @@ def cmd_update(config, args, all)
   die 'say a tree or --all, not both' if args.first && all
 
   list = args.first ? [require_tree(config, args.first)] : every_tree(config)
-  fetched = {}
-  failed = false
-
-  report_trees(list) do |tree|
-    notes, broke = fill_tree(config, tree, fetched, report_existing: false)
-    failed ||= broke
-    notes
-  end
-  exit 1 if failed
+  report(*fill_trees(config, list, report_existing: false))
 end
 
 def cmd_update_detached(config, args, all)
   die 'update-detached takes at most one tree name; see wt --help' if args.size > 1
 
   list = targets(config, args.first, all, 'update-detached')
-  fetched = {}
-  failed = false
-
-  report_trees(list) do |tree|
-    repo_entries(config, tree).filter_map do |name, path|
-      next unless Dir.exist?(path)
-
-      note, ok = redetach(path, fetched)
-      failed ||= !ok
-      [name, note]
-    end
-  end
-  exit 1 if failed
+  report(*across_repos(config, list) { |_, path| redetach(path) if Dir.exist?(path) })
 end
 
 def cmd_reset_to_head(config, args, force)
   die 'reset-to-head takes at most one tree name; see wt --help' if args.size > 1
 
-  tree = args.first ? require_tree(config, args.first) : current_tree(config)
-  die "not in a tree — say 'wt reset-to-head TREE'" unless tree
-
-  fetched = {}
-  failed = false
-  notes = repo_entries(config, tree).filter_map do |name, path|
-    next unless Dir.exist?(path)
-
-    note, ok = reset_to_head(path, fetched, force)
-    failed ||= !ok
-    [name, note]
-  end
-  print_notes(notes)
-  exit 1 if failed
+  tree = tree_or_here(config, args.first, 'reset-to-head')
+  report(*across_repos(config, [tree]) { |_, path| reset_to_head(path, force) if Dir.exist?(path) })
 end
 
 def cmd_remove(config, args, force)
@@ -450,16 +453,10 @@ def cmd_remove(config, args, force)
 
   tree = require_tree(config, args.first)
   tree_dir = File.join(config.root, tree)
-  failed = false
-
-  notes = repo_entries(config, tree).filter_map do |name, path|
-    next unless Dir.exist?(path)
-
-    note, ok = drop_worktree(config.repos[name] || path, path, force)
-    failed ||= !ok
-    [name, note]
+  results, failed = across_repos(config, [tree]) do |name, path|
+    drop_worktree(config.repos[name] || path, path, force) if Dir.exist?(path)
   end
-  print_notes(notes)
+  print_notes(results[tree])
 
   die "#{tree_dir} left in place" if failed
 
@@ -542,8 +539,7 @@ end
 def cmd_repo_paths(config, args)
   die 'repo-paths takes at most one tree name; see wt --help' if args.size > 1
 
-  tree = args.first ? require_tree(config, args.first) : current_tree(config)
-  die "not in a tree — say 'wt repo-paths TREE'" unless tree
+  tree = tree_or_here(config, args.first, 'repo-paths')
 
   paths = repo_entries(config, tree).filter_map { |_, path| path if Dir.exist?(path) }
   die "no repos in #{tree}" if paths.empty?

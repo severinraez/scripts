@@ -3,11 +3,12 @@
 # spans every repository, so the checkouts under it are the set you work on together. Every
 # repo in a fresh tree sits detached on origin/main, the way work starts before a branch.
 #
-#   wt                              in a tree: that tree, its repos, and what each has
-#                                   checked out; anywhere else: every tree, the same way
+#   wt                              in a tree: that tree, its repos, what each has checked
+#                                   out and its git status; anywhere else: every tree
 #   wt --name                       the name of the tree you are in, on its own
 #   wt list                      l  every tree name
-#   wt list-repos               lr  every tree, its repos, and what each has checked out
+#   wt list-repos               lr  every tree, its repos, what each has checked out, and
+#                                   whether it has changed or untracked files
 #   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
 #                                   path of every tree, one per line
 #   wt repo-paths [TREE]        rp  the repos of a tree, space separated on one line, to
@@ -139,6 +140,23 @@ def head_state(path)
   ok ? "detached #{head}" : '-'
 end
 
+# What the checkout has that no commit does: tracked files changed, files git does not know
+# about, or clean. Empty when there is no checkout to ask — head_state has said so already.
+def work_state(path)
+  return '' unless Dir.exist?(path)
+
+  out, ok = git(path, 'status', '--porcelain')
+  return '' unless ok
+
+  lines = out.lines
+  untracked = lines.count { |line| line.start_with?('??') }
+  changed = lines.size - untracked
+  parts = []
+  parts << "#{changed} changed" if changed.positive?
+  parts << "#{untracked} untracked" if untracked.positive?
+  parts.empty? ? 'clean' : parts.join(', ')
+end
+
 # The ref a detached checkout hangs off. origin/main is what everything uses; a repo that
 # never renamed its default branch still has origin/master, so take that instead.
 def default_ref(dir)
@@ -221,9 +239,19 @@ def print_notes(notes, indent: '')
   notes.each { |name, note| puts "#{indent}#{name.ljust(width)}  #{note}" }
 end
 
-def print_tree(config, tree)
-  puts tree
-  print_notes(repo_entries(config, tree).map { |name, path| [name, head_state(path)] }, indent: '  ')
+# Each tree, its repos, what each has checked out and whether it has work in it. The columns
+# line up across all the trees printed, not just within one, so they read as one table.
+def print_trees(config, list)
+  rows = list.to_h do |tree|
+    [tree, repo_entries(config, tree).map { |name, path| [name, head_state(path), work_state(path)] }]
+  end
+  all = rows.values.flatten(1)
+  name_width = all.map { |name, _, _| name.length }.max || 0
+  head_width = all.map { |_, head, _| head.length }.max || 0
+  rows.each do |tree, repos|
+    puts tree
+    repos.each { |name, head, work| puts "  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip }
+  end
 end
 
 # Walk the trees a command is aimed at, printing what each had to say. A tree's name goes
@@ -547,9 +575,9 @@ def cmd_default(config, args)
   die 'too many arguments; see wt --help' unless args.empty?
 
   here = current_tree(config)
-  return print_tree(config, here) if here
+  return print_trees(config, [here]) if here
 
-  trees(config).each { |tree| print_tree(config, tree) }
+  print_trees(config, trees(config))
 end
 
 # --- dispatch --------------------------------------------------------------------------
@@ -585,7 +613,7 @@ config = load_config
 case command
 when nil then name ? cmd_name(config) : cmd_default(config, args)
 when 'list' then trees(config).each { |tree| puts tree }
-when 'list-repos' then trees(config).each { |tree| print_tree(config, tree) }
+when 'list-repos' then print_trees(config, trees(config))
 when 'path' then cmd_path(config, args)
 when 'repo-paths' then cmd_repo_paths(config, args)
 when 'main-repo-paths' then cmd_main_repo_paths(config, args)

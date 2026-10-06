@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # wt — get around the worktree layout <worktree_root>/<tree>/<repo>: a tree is one name that
 # spans every repository, so the checkouts under it are the set you work on together. Every
-# repo in a fresh tree sits detached on origin/main, the way work starts before a branch.
+# repo in a fresh tree sits detached on origin/HEAD, the way work starts before a branch.
 #
 #   wt                              in a tree: that tree, its repos, what each has checked
 #                                   out and its git status; anywhere else: every tree
@@ -9,7 +9,9 @@
 #   wt list                      l  every tree name
 #   wt list-repos               lr  every tree, its repos, what each has checked out, and
 #                                   whether it has changed or untracked files. Each tree and
-#                                   each repo comes with a number to hand to wt path
+#                                   each repo comes with a number to hand to wt path. A
+#                                   detached repo shows as origin when it is on origin/HEAD,
+#                                   stale when it is not
 #   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
 #                                   path of every tree, one per line
 #   wt path INDEX                p  the tree or repo that number stands for in wt list-repos.
@@ -18,13 +20,13 @@
 #                                   hand to something else
 #   wt main-repo-paths         mrp  the main working copies the worktrees are cut from,
 #                                   the same way
-#   wt add TREE                  a  make TREE, every repo in it detached on origin/main
+#   wt add TREE                  a  make TREE, every repo in it detached on origin/HEAD
 #   wt update [TREE]             u  cut the worktrees a tree is missing; with no TREE, every
 #                                   tree there is
 #   wt update-detached [TREE]   ud  the repos there sitting detached: fetch, then detach
-#                                   again on origin/main. --all for every tree
+#                                   again on origin/HEAD. --all for every tree
 #   wt reset-to-head [TREE]    rth  every repo there, branch or not: fetch, then detach on
-#                                   origin/main. One with uncommitted changes is left alone;
+#                                   origin/HEAD. One with uncommitted changes is left alone;
 #                                   --force throws the changes away. Branches stay as they are
 #   wt remove TREE [--force]    rm  take TREE and the worktrees in it away
 #   wt prune                    pr  in every repository, forget the worktrees whose
@@ -41,8 +43,8 @@
 #
 # repositories maps the directory name a repo gets inside a tree to the working copy its
 # worktrees are cut from. Paths are ~-expanded, and a relative one is read off the config's
-# own directory. A repo that never renamed its default branch is taken from origin/master
-# where origin/main is what everything else uses.
+# own directory. origin/HEAD is whatever branch origin calls its default; a repo without
+# one is an error, and wt says the git remote command that sets it.
 
 # frozen_string_literal: true
 
@@ -138,6 +140,20 @@ def head_state(path)
   ok ? "detached #{head}" : '-'
 end
 
+# head_state as wt and wt list-repos show it: a detached checkout is origin when it sits on
+# the commit origin/HEAD points at, stale when it does not. nil when the repo has no
+# origin/HEAD to hold it against.
+def shown_head(path)
+  state = head_state(path)
+  return state unless state.start_with?('detached ')
+
+  origin, ok = git(path, 'rev-parse', '--verify', '--quiet', 'refs/remotes/origin/HEAD')
+  return nil unless ok
+
+  head, = git(path, 'rev-parse', 'HEAD')
+  "#{head == origin ? 'origin' : 'stale'} #{state.delete_prefix('detached ')}"
+end
+
 # What the checkout has that no commit does: tracked files changed, files git does not know
 # about, or clean. Empty when there is no checkout to ask — head_state has said so already.
 def work_state(path)
@@ -156,14 +172,16 @@ def work_state(path)
 end
 
 # The ref a detached checkout hangs off, and the commit it is on, short — nil when there is
-# neither. origin/main is what everything uses; a repo that never renamed its default branch
-# still has origin/master, so take that instead.
+# none. That is origin/HEAD, which names origin's default branch, main or master or whatever
+# it is.
 def default_ref(dir)
-  %w[origin/main origin/master].each do |ref|
-    head, ok = git(dir, 'rev-parse', '--verify', '--quiet', '--short', ref)
-    return [ref, head] if ok
-  end
-  nil
+  head, ok = git(dir, 'rev-parse', '--verify', '--quiet', '--short', 'refs/remotes/origin/HEAD')
+  ok ? ['refs/remotes/origin/HEAD', head] : nil
+end
+
+# What to say when a repo has no origin/HEAD: the command that sets it.
+def no_origin_head(dir)
+  "no origin/HEAD — set it with: git -C #{dir} remote set-head origin --auto"
 end
 
 def repo?(dir)
@@ -266,12 +284,17 @@ end
 
 # Each repo of the given trees, what it has checked out and whether it has work in it, by
 # tree. Every checkout is asked at the same time — they do not depend on one another, and a
-# git status on a big repo is worth not waiting out one after another.
+# git status on a big repo is worth not waiting out one after another. A detached repo with
+# no origin/HEAD stops it all: there is nothing to say whether it is stale.
 def tree_rows(config, list)
   threads = list.to_h do |tree|
-    [tree, repo_entries(config, tree).map { |name, path| Thread.new { [name, head_state(path), work_state(path)] } }]
+    [tree, repo_entries(config, tree).map { |name, path| Thread.new { [name, path, shown_head(path), work_state(path)] } }]
   end
-  threads.transform_values { |repos| repos.map(&:value) }
+  rows = threads.transform_values { |repos| repos.map(&:value) }
+  _, path, = rows.values.flatten(1).find { |_, _, head, _| head.nil? }
+  die "#{path}: #{no_origin_head(path)}" if path
+
+  rows.transform_values { |repos| repos.map { |name, _, head, work| [name, head, work] } }
 end
 
 # Every tree and every repo in it, numbered from 1 in the order wt list-repos prints them —
@@ -353,7 +376,7 @@ def cut_worktree(source, path)
 
   Pending.new(source, lambda do
     ref, head = default_ref(source)
-    return ['no origin/main or origin/master', false] unless ref
+    return [no_origin_head(source), false] unless ref
 
     out, ok = git(source, 'worktree', 'add', '--detach', path, ref)
     ok ? ["detached #{head}", true] : ["worktree add failed: #{last_line(out)}", false]
@@ -385,7 +408,7 @@ end
 # Detach a checkout on its repo's default ref, saying where it came from.
 def detach_on_default(path, state, force: false)
   ref, head = default_ref(path)
-  return ['no origin/main or origin/master', false] unless ref
+  return [no_origin_head(path), false] unless ref
 
   args = %w[checkout --quiet --detach]
   args << '--force' if force
@@ -533,8 +556,8 @@ TEMPLATE = <<~YML
 
   # The directory name a repo gets inside a tree, and the working copy its worktrees are
   # cut from. Paths are ~-expanded, and a relative one is read off this file's own
-  # directory. A fresh worktree comes up detached on origin/main, or origin/master where
-  # that is the repo's default branch.
+  # directory. A fresh worktree comes up detached on origin/HEAD, origin's default branch;
+  # a repo without one needs a 'git remote set-head origin --auto' first.
   repositories:
     repo-1: ~/dev/repo-1
     repo-2: ~/dev/repo-2

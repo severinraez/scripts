@@ -210,11 +210,17 @@ end
 
 # The tree the cwd is in, read off the path itself — nil outside the layout.
 def current_tree(config)
+  current_spot(config)&.first
+end
+
+# The tree the cwd is in and the directory in it, read off the path itself: [tree, repo],
+# the repo nil in the tree's own directory. nil outside the layout.
+def current_spot(config)
   root = File.realpath(config.root)
   pwd = File.realpath(Dir.pwd)
   return nil unless pwd.start_with?("#{root}/")
 
-  pwd.delete_prefix("#{root}/").split('/').first
+  pwd.delete_prefix("#{root}/").split('/').take(2).then { |tree, repo| [tree, repo] }
 rescue SystemCallError
   nil
 end
@@ -281,19 +287,23 @@ end
 
 # Each tree, its repos, what each has checked out and whether it has work in it, each tree
 # and repo under its number. The columns line up across all the trees printed, not just
-# within one, so they read as one table.
+# within one, so they read as one table. The line for where the cwd is goes in bold: the
+# repo it is in, or the tree when it is in none of the tree's repos.
 def print_trees(config, list)
   rows = tree_rows(config, list)
   numbers = numbered(config)
+  here = current_spot(config)
+  here = [here.first, nil] if here && !rows[here.first]&.any? { |name, _, _| name == here.last }
+  line = ->(key, text) { puts(key == here && $stdout.tty? ? "\e[1m#{text}\e[0m" : text) }
   all = rows.values.flatten(1)
   index_width = numbers.values.map { |index, _| index.to_s.length }.max || 0
   name_width = all.map { |name, _, _| name.length }.max || 0
   head_width = all.map { |_, head, _| head.length }.max || 0
   index = ->(tree, name) { numbers.dig([tree, name], 0).to_s.rjust(index_width) }
   rows.each do |tree, repos|
-    puts "#{index.(tree, nil)}  #{tree}"
+    line.([tree, nil], "#{index.(tree, nil)}  #{tree}")
     repos.each do |name, head, work|
-      puts "  #{index.(tree, name)}  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip
+      line.([tree, name], "  #{index.(tree, name)}  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip)
     end
   end
 end

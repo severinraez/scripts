@@ -8,9 +8,12 @@
 #   wt --name                       the name of the tree you are in, on its own
 #   wt list                      l  every tree name
 #   wt list-repos               lr  every tree, its repos, what each has checked out, and
-#                                   whether it has changed or untracked files
+#                                   whether it has changed or untracked files. Each tree and
+#                                   each repo comes with a number to hand to wt path
 #   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
 #                                   path of every tree, one per line
+#   wt path INDEX                p  the tree or repo that number stands for in wt list-repos.
+#                                   A tree named like a number is still that tree
 #   wt repo-paths [TREE]        rp  the repos of a tree, space separated on one line, to
 #                                   hand to something else
 #   wt main-repo-paths         mrp  the main working copies the worktrees are cut from,
@@ -265,16 +268,33 @@ def tree_rows(config, list)
   threads.transform_values { |repos| repos.map(&:value) }
 end
 
-# Each tree, its repos, what each has checked out and whether it has work in it. The columns
-# line up across all the trees printed, not just within one, so they read as one table.
+# Every tree and every repo in it, numbered from 1 in the order wt list-repos prints them —
+# one count through both, so a number is one thing, and wt path takes it in place of a tree
+# or a tree and a repo. Keyed by [tree, repo], the repo nil for the tree itself. Read off the
+# directories alone, so a number means the same thing wherever the listing was printed from.
+def numbered(config)
+  entries = trees(config).flat_map do |tree|
+    [[tree, nil, File.join(config.root, tree)], *repo_entries(config, tree).map { |name, path| [tree, name, path] }]
+  end
+  entries.each.with_index(1).to_h { |entry, index| [entry.take(2), [index, entry.last]] }
+end
+
+# Each tree, its repos, what each has checked out and whether it has work in it, each tree
+# and repo under its number. The columns line up across all the trees printed, not just
+# within one, so they read as one table.
 def print_trees(config, list)
   rows = tree_rows(config, list)
+  numbers = numbered(config)
   all = rows.values.flatten(1)
+  index_width = numbers.values.map { |index, _| index.to_s.length }.max || 0
   name_width = all.map { |name, _, _| name.length }.max || 0
   head_width = all.map { |_, head, _| head.length }.max || 0
+  index = ->(tree, name) { numbers.dig([tree, name], 0).to_s.rjust(index_width) }
   rows.each do |tree, repos|
-    puts tree
-    repos.each { |name, head, work| puts "  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip }
+    puts "#{index.(tree, nil)}  #{tree}"
+    repos.each do |name, head, work|
+      puts "  #{index.(tree, name)}  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip
+    end
   end
 end
 
@@ -526,12 +546,25 @@ def cmd_path(config, args)
   die 'path takes a tree and a repo at most; see wt --help' if args.size > 2
 
   return trees(config).each { |tree| puts File.join(config.root, tree) } if args.empty?
-  return puts File.join(config.root, require_tree(config, args.first)) if args.size == 1
+  return puts path_of_one(config, args.first) if args.size == 1
 
   path = File.join(config.root, args[0], args[1])
   die "no such worktree: #{path}" unless Dir.exist?(path)
 
   puts path
+end
+
+# A tree by name, or else a tree or repo by its number in wt list-repos. The tree wins: a number is
+# only ever looked up when no tree goes by it.
+def path_of_one(config, arg)
+  return File.join(config.root, arg) if Dir.exist?(File.join(config.root, arg))
+  return File.join(config.root, require_tree(config, arg)) unless arg.match?(/\A\d+\z/)
+
+  _, path = numbered(config).values.find { |index, _| index == arg.to_i }
+  die "no tree named #{arg}, and nothing numbered #{arg}" unless path
+  die "no such worktree: #{path}" unless Dir.exist?(path)
+
+  path
 end
 
 # The repos of a tree on one line, space separated, for something else to take in one go —

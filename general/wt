@@ -12,6 +12,9 @@
 #                                   each repo comes with a number to hand to wt path. A
 #                                   detached repo shows as origin when it is on origin/HEAD,
 #                                   stale when it is not
+#                                   On a terminal wide enough, wt and wt list-repos add the
+#                                   changed and untracked files, dimmed, cut short with … +N
+#                                   when they do not all fit
 #   wt path [TREE [REPO]]        p  where a tree lives, or one repo in it; with no TREE, the
 #                                   path of every tree, one per line
 #   wt path INDEX                p  the tree or repo that number stands for in wt list-repos.
@@ -49,6 +52,7 @@
 # frozen_string_literal: true
 
 require 'fileutils'
+require 'io/console'
 require 'open3'
 require 'yaml'
 
@@ -155,12 +159,13 @@ def shown_head(path)
 end
 
 # What the checkout has that no commit does: tracked files changed, files git does not know
-# about, or clean. Empty when there is no checkout to ask — head_state has said so already.
+# about, or clean, and the names of those files. Empty when there is no checkout to ask —
+# head_state has said so already.
 def work_state(path)
-  return '' unless Dir.exist?(path)
+  return ['', []] unless Dir.exist?(path)
 
   out, ok = git(path, 'status', '--porcelain')
-  return '' unless ok
+  return ['', []] unless ok
 
   lines = out.lines
   untracked = lines.count { |line| line.start_with?('??') }
@@ -168,7 +173,45 @@ def work_state(path)
   parts = []
   parts << "#{changed} changed" if changed.positive?
   parts << "#{untracked} untracked" if untracked.positive?
-  parts.empty? ? 'clean' : parts.join(', ')
+  # git() strips the output, which can eat the first line's leading space, so take the
+  # path as whatever follows the status letters rather than at a fixed column.
+  # Changed files first, then untracked, so a truncated list keeps what matters most.
+  files = lines.partition { |line| !line.start_with?('??') }.flatten.map { |line| line.chomp.sub(/\A\s*\S+\s+/, '') }
+  [parts.empty? ? 'clean' : parts.join(', '), files]
+end
+
+# How many columns the terminal has, or nil when stdout is not one — a pipe or a file gets
+# no layout that depends on a screen. Asked once, as wt starts printing.
+def terminal_width
+  return nil unless $stdout.tty?
+
+  cols = $stdout.winsize.last
+  cols.positive? ? cols : nil
+rescue SystemCallError
+  nil
+end
+
+# The files in as many columns as there are: as many whole names as fit, then how many more
+# there are, and a name that is too long alone loses its front, the end being what tells
+# files apart.
+def fit_files(files, width)
+  return '' if files.empty? || width < 1
+
+  all = files.join(', ')
+  return all if all.length <= width
+
+  shown = []
+  files.each_with_index do |file, i|
+    tail = i == files.size - 1 ? '' : ", … +#{files.size - i - 1}"
+    break if (shown + [file]).join(', ').length + tail.length > width
+
+    shown << file
+  end
+  return "#{shown.join(', ')}, … +#{files.size - shown.size}" unless shown.empty?
+
+  more = files.size > 1 ? " +#{files.size - 1}" : ''
+  room = width - more.length - 1
+  room.positive? ? "…#{files.first[-room..]}#{more}" : '…'
 end
 
 # The ref a detached checkout hangs off, and the commit it is on, short — nil when there is
@@ -288,13 +331,13 @@ end
 # no origin/HEAD stops it all: there is nothing to say whether it is stale.
 def tree_rows(config, list)
   threads = list.to_h do |tree|
-    [tree, repo_entries(config, tree).map { |name, path| Thread.new { [name, path, shown_head(path), work_state(path)] } }]
+    [tree, repo_entries(config, tree).map { |name, path| Thread.new { [name, path, shown_head(path), *work_state(path)] } }]
   end
   rows = threads.transform_values { |repos| repos.map(&:value) }
-  _, path, = rows.values.flatten(1).find { |_, _, head, _| head.nil? }
+  _, path, = rows.values.flatten(1).find { |_, _, head, *| head.nil? }
   die "#{path}: #{no_origin_head(path)}" if path
 
-  rows.transform_values { |repos| repos.map { |name, _, head, work| [name, head, work] } }
+  rows.transform_values { |repos| repos.map { |name, _, head, work, files| [name, head, work, files] } }
 end
 
 # Every tree and every repo in it, numbered from 1 in the order wt list-repos prints them —
@@ -312,21 +355,32 @@ end
 # and repo under its number. The columns line up across all the trees printed, not just
 # within one, so they read as one table. The line for where the cwd is goes in bold: the
 # repo it is in, or the tree when it is in none of the tree's repos.
+MIN_FILES_WIDTH = 20
+
 def print_trees(config, list)
   rows = tree_rows(config, list)
   numbers = numbered(config)
   here = current_spot(config)
-  here = [here.first, nil] if here && !rows[here.first]&.any? { |name, _, _| name == here.last }
+  here = [here.first, nil] if here && !rows[here.first]&.any? { |name, *| name == here.last }
   line = ->(key, text) { puts(key == here && $stdout.tty? ? "\e[1m#{text}\e[0m" : text) }
   all = rows.values.flatten(1)
   index_width = numbers.values.map { |index, _| index.to_s.length }.max || 0
-  name_width = all.map { |name, _, _| name.length }.max || 0
-  head_width = all.map { |_, head, _| head.length }.max || 0
+  name_width = all.map { |name, *| name.length }.max || 0
+  head_width = all.map { |_, head, *| head.length }.max || 0
+  work_width = all.map { |_, _, work, _| work.length }.max || 0
+  # The files column takes what the terminal has left after the others, and only when that
+  # is enough to say something with.
+  term = terminal_width
+  files_width = term ? term - (index_width + name_width + head_width + work_width + 12) : 0
+  files_width = 0 if files_width < MIN_FILES_WIDTH
   index = ->(tree, name) { numbers.dig([tree, name], 0).to_s.rjust(index_width) }
   rows.each do |tree, repos|
     line.([tree, nil], "#{index.(tree, nil)}  #{tree}")
-    repos.each do |name, head, work|
-      line.([tree, name], "  #{index.(tree, name)}  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work}".rstrip)
+    repos.each do |name, head, work, files|
+      cells = "  #{index.(tree, name)}  #{name.ljust(name_width)}  #{head.ljust(head_width)}  #{work.ljust(work_width)}"
+      # Dim, not a colour: it is lighter than the text around it on a dark background and on a light one.
+      cells += "  \e[2m#{fit_files(files, files_width)}\e[22m" if files_width.positive? && files.any?
+      line.([tree, name], cells.rstrip)
     end
   end
 end

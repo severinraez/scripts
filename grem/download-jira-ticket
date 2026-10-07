@@ -1,0 +1,351 @@
+#!/usr/bin/env ruby
+# download-jira-ticket — put a Jira ticket on disk, in a new folder named after it in the cwd:
+#
+#   download-jira-ticket ISSUE-NUMBER       e.g. REM-33725, or the ticket's browse URL
+#
+#   ISSUE-NUMBER/ticket.md      title, description, release notes, notes for testing, linked
+#                               items, merge requests and the list of attachments
+#   ISSUE-NUMBER/comments.md    every comment, oldest first
+#   ISSUE-NUMBER/attachments/   every attachment, one file each
+#
+# The ticket comes through acli, which has to be logged in (acli jira auth login). acli can't
+# download attachments or read web links, so for those the script goes to the REST API with
+# an API token from $JIRA_API_TOKEN, or else ~/notes/.jira-api-token (the one
+# enhance_jira_links uses). The email comes from $JIRA_EMAIL, ~/notes/.jira-api-email or the
+# account acli is logged in as. Without a token the attachments are only listed. Merge requests are the ones on gitlab.garaio-rem.com that
+# name the ticket in their title or description, found through glab.
+
+# frozen_string_literal: true
+
+require 'fileutils'
+require 'json'
+require 'net/http'
+require 'open3'
+require 'uri'
+
+SITE = 'garaiorem.atlassian.net'
+GITLAB = 'gitlab.garaio-rem.com'
+RELEASE_NOTES_FIELD = 'customfield_10068'
+TESTING_NOTES_FIELD = 'customfield_10309'
+# Where enhance_jira_links in ~/notes keeps them, so both use the same token.
+TOKEN_FILE = File.expand_path('~/notes/.jira-api-token')
+EMAIL_FILE = File.expand_path('~/notes/.jira-api-email')
+
+def die(message)
+  warn "download-jira-ticket: #{message}"
+  exit 1
+end
+
+def note(message)
+  warn "download-jira-ticket: #{message}"
+end
+
+def usage
+  lines = File.readlines(__FILE__).drop(1).take_while { |line| line.start_with?('#') }
+  lines.each { |line| puts line.sub(/\A# ?/, '').rstrip }
+end
+
+def run(*cmd)
+  out, err, status = Open3.capture3(*cmd)
+  [out, err, status.success?]
+rescue Errno::ENOENT
+  [nil, "#{cmd.first} not found", false]
+end
+
+# --- Atlassian Document Format to Markdown ----------------------------------------------
+
+def adf(node)
+  return '' if node.nil?
+  return node if node.is_a?(String)
+
+  blocks(node['content']).strip
+end
+
+def blocks(nodes)
+  (nodes || []).map { |n| block(n) }.reject(&:empty?).join("\n\n")
+end
+
+def block(node)
+  content = node['content']
+  attrs = node['attrs'] || {}
+  case node['type']
+  when 'paragraph' then inline(content)
+  when 'heading' then "#{'#' * (attrs['level'] || 1).clamp(1, 6)} #{inline(content)}"
+  when 'bulletList' then list(content) { '- ' }
+  when 'orderedList' then list(content) { |i| "#{(attrs['order'] || 1) + i}. " }
+  when 'codeBlock' then "```#{attrs['language']}\n#{content&.map { |n| n['text'] }&.join}\n```"
+  when 'blockquote' then quote(blocks(content))
+  when 'panel' then quote("**#{attrs['panelType'] || 'info'}:** #{blocks(content)}")
+  when 'expand', 'nestedExpand' then [attrs['title'] && "**#{attrs['title']}**", blocks(content)].compact.join("\n\n")
+  when 'rule' then '---'
+  when 'mediaSingle', 'mediaGroup' then content&.map { |n| media(n) }&.join("\n") || ''
+  when 'media' then media(node)
+  when 'table' then table(content)
+  when 'blockCard', 'embedCard' then "<#{attrs['url']}>"
+  else content ? blocks(content) : inline([node])
+  end
+end
+
+def quote(text)
+  text.lines.map { |l| l.strip.empty? ? '>' : "> #{l.chomp}" }.join("\n")
+end
+
+def list(items)
+  (items || []).each_with_index.map do |item, i|
+    marker = yield(i)
+    body = blocks(item['content'])
+    body.lines.each_with_index.map do |line, j|
+      j.zero? ? "#{marker}#{line}" : (line.strip.empty? ? line : "#{' ' * marker.size}#{line}")
+    end.join.chomp
+  end.join("\n")
+end
+
+def table(rows)
+  cells = (rows || []).map do |row|
+    row['content'].map { |cell| blocks(cell['content']).gsub(/\s*\n+\s*/, '<br>').gsub('|', '\|') }
+  end
+  return '' if cells.empty?
+
+  width = cells.map(&:size).max
+  cells = cells.map { |r| r + [''] * (width - r.size) }
+  ["| #{cells[0].join(' | ')} |", "|#{' --- |' * width}", *cells.drop(1).map { |r| "| #{r.join(' | ')} |" }].join("\n")
+end
+
+def media(node)
+  attrs = node['attrs'] || {}
+  return "<#{attrs['url']}>" if attrs['type'] == 'external'
+
+  # Without alt there is no filename, and the media id is not the attachment's id.
+  name = attrs['alt'] or return '_(embedded attachment)_'
+
+  "![#{name}](attachments/#{URI::DEFAULT_PARSER.escape(name.to_s)})"
+end
+
+def inline(nodes)
+  (nodes || []).map do |n|
+    attrs = n['attrs'] || {}
+    case n['type']
+    when 'text' then marked(n['text'], n['marks'] || [])
+    when 'hardBreak' then "  \n"
+    when 'mention' then attrs['text'] || '@someone'
+    when 'emoji' then attrs['text'] || attrs['shortName']
+    when 'inlineCard' then "<#{attrs['url']}>"
+    when 'status' then "`#{attrs['text']}`"
+    when 'date' then Time.at(attrs['timestamp'].to_i / 1000).strftime('%Y-%m-%d')
+    when 'mediaInline', 'media' then media(n)
+    else n['content'] ? inline(n['content']) : (n['text'] || '')
+    end
+  end.join
+end
+
+def marked(text, marks)
+  return text if text.strip.empty?
+
+  types = marks.map { |m| m['type'] }
+  out = types.include?('code') ? "`#{text}`" : text
+  lead = out[/\A\s*/]
+  trail = out[/\s*\z/]
+  core = out.strip
+  core = "**#{core}**" if types.include?('strong')
+  core = "_#{core}_" if types.include?('em')
+  core = "~~#{core}~~" if types.include?('strike')
+  link = marks.find { |m| m['type'] == 'link' }
+  core = "[#{core}](#{link['attrs']['href']})" if link
+  "#{lead}#{core}#{trail}"
+end
+
+# --- Fetching ----------------------------------------------------------------------------
+
+def issue(key)
+  out, err, ok = run('acli', 'jira', 'workitem', 'view', key, '--fields', '*all', '--json')
+  die("acli could not get #{key}: #{err.strip}") unless ok
+  JSON.parse(out)
+end
+
+def secret(variable, file)
+  value = ENV.fetch(variable, '').strip
+  value = File.read(file).strip if value.empty? && File.file?(file)
+  value.empty? ? nil : value
+end
+
+def credentials
+  token = secret('JIRA_API_TOKEN', TOKEN_FILE) or return nil
+  email = secret('JIRA_EMAIL', EMAIL_FILE)
+  email ||= run('acli', 'jira', 'auth', 'status').first.to_s[/Email:\s*(\S+)/, 1]
+  unless email
+    note("have an API token but no email: set JIRA_EMAIL or write #{EMAIL_FILE}")
+    return nil
+  end
+
+  [email, token]
+end
+
+def rest_get(path, auth, limit = 5)
+  uri = path.start_with?('http') ? URI(path) : URI("https://#{SITE}#{path}")
+  request = Net::HTTP::Get.new(uri)
+  request.basic_auth(*auth)
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |http| http.request(request) }
+  case response
+  when Net::HTTPSuccess then response.body
+  when Net::HTTPRedirection
+    raise 'too many redirects' if limit.zero?
+
+    # The redirect goes to the media store with a signed URL, which takes no basic auth.
+    target = URI(response['location'])
+    return rest_get(target.to_s, auth, limit - 1) if target.host == SITE
+
+    Net::HTTP.get_response(target).tap { |r| raise "HTTP #{r.code}" unless r.is_a?(Net::HTTPSuccess) }.body
+  else raise "HTTP #{response.code} for #{uri}"
+  end
+end
+
+def merge_requests(key)
+  out, err, ok = run('glab', 'api', '--hostname', GITLAB,
+                     "merge_requests?scope=all&search=#{key}&in=title,description&per_page=100")
+  unless ok
+    note("could not search merge requests: #{err.strip}")
+    return []
+  end
+
+  JSON.parse(out)
+end
+
+def attachment_names(attachments)
+  seen = Hash.new(0)
+  attachments.sort_by { |a| a['created'].to_s }.to_h do |a|
+    name = a['filename'].tr('/', '_')
+    seen[name] += 1
+    name = "#{File.basename(name, '.*')}-#{a['id']}#{File.extname(name)}" if seen[name] > 1
+    [a['id'], name]
+  end
+end
+
+# --- Writing -----------------------------------------------------------------------------
+
+def person(user)
+  user ? user['displayName'] : '-'
+end
+
+def day(time)
+  time.to_s.sub(/\A(\d{4}-\d\d-\d\d)T(\d\d:\d\d).*/, '\1 \2')
+end
+
+def section(title, body)
+  "## #{title}\n\n#{body.to_s.strip.empty? ? '_none_' : body.strip}\n"
+end
+
+def linked_items(fields, remote_links)
+  lines = (fields['issuelinks'] || []).map do |link|
+    other = link['outwardIssue'] || link['inwardIssue']
+    relation = link['outwardIssue'] ? link['type']['outward'] : link['type']['inward']
+    "- #{relation} [#{other['key']}](https://#{SITE}/browse/#{other['key']}): " \
+      "#{other.dig('fields', 'summary')} (#{other.dig('fields', 'status', 'name')})"
+  end
+  if (parent = fields['parent'])
+    lines.unshift("- parent [#{parent['key']}](https://#{SITE}/browse/#{parent['key']}): #{parent.dig('fields', 'summary')}")
+  end
+  (fields['subtasks'] || []).each do |sub|
+    lines << "- subtask [#{sub['key']}](https://#{SITE}/browse/#{sub['key']}): #{sub.dig('fields', 'summary')}"
+  end
+  (remote_links || []).each do |link|
+    object = link['object'] || {}
+    lines << "- #{link['relationship'] || 'link'} [#{object['title'] || object['url']}](#{object['url']})"
+  end
+  lines.join("\n")
+end
+
+def ticket_md(data, mrs, remote_links, names)
+  fields = data['fields']
+  key = data['key']
+  meta = {
+    'Link' => "https://#{SITE}/browse/#{key}",
+    'Type' => fields.dig('issuetype', 'name'),
+    'Status' => fields.dig('status', 'name'),
+    'Priority' => fields.dig('priority', 'name'),
+    'Assignee' => person(fields['assignee']),
+    'Reporter' => person(fields['reporter']),
+    'Fix versions' => (fields['fixVersions'] || []).map { |v| v['name'] }.join(', '),
+    'Labels' => (fields['labels'] || []).join(', '),
+    'Created' => day(fields['created']),
+    'Updated' => day(fields['updated'])
+  }.reject { |_, v| v.to_s.empty? }
+
+  mr_lines = mrs.map do |mr|
+    "- [!#{mr['iid']} #{mr['title']}](#{mr['web_url']}) (#{mr['state']}, `#{mr['source_branch']}`)"
+  end
+  attachment_lines = (fields['attachment'] || []).map do |a|
+    name = names[a['id']]
+    "- [#{name}](attachments/#{URI::DEFAULT_PARSER.escape(name)}) (#{person(a['author'])}, #{day(a['created'])})"
+  end
+  remote_note = remote_links.nil? ? "\n\n_Web links not fetched; they need the API token._" : ''
+
+  [
+    "# #{key}: #{fields['summary']}\n",
+    meta.map { |k, v| "- **#{k}:** #{v}" }.join("\n") + "\n",
+    section('Description', adf(fields['description'])),
+    section('Release notes', adf(fields[RELEASE_NOTES_FIELD])),
+    section('Notes for testing', adf(fields[TESTING_NOTES_FIELD])),
+    section('Linked items', linked_items(fields, remote_links) + remote_note),
+    section('Merge requests', mr_lines.join("\n")),
+    section('Attachments', attachment_lines.join("\n"))
+  ].join("\n")
+end
+
+def comments_md(data)
+  comments = data.dig('fields', 'comment', 'comments') || []
+  body = comments.map do |c|
+    edited = c['updated'] && c['updated'] != c['created'] ? ", edited #{day(c['updated'])}" : ''
+    "## #{person(c['author'])}, #{day(c['created'])}#{edited}\n\n#{adf(c['body'])}\n"
+  end
+  "# #{data['key']}: comments\n\n#{body.empty? ? "_none_\n" : body.join("\n")}"
+end
+
+# --- Main --------------------------------------------------------------------------------
+
+if ARGV.empty? || %w[-h --help help].include?(ARGV.first)
+  usage
+  exit(ARGV.empty? ? 1 : 0)
+end
+die('one ISSUE-NUMBER only') if ARGV.size > 1
+
+key = ARGV.first[/[A-Z][A-Z0-9]+-\d+/i]&.upcase or die("not an issue number: #{ARGV.first}")
+dir = File.join(Dir.pwd, key)
+die("#{key} already exists here") if File.exist?(dir)
+
+data = issue(key)
+auth = credentials
+attachments = data.dig('fields', 'attachment') || []
+names = attachment_names(attachments)
+
+remote_links = nil
+if auth
+  begin
+    remote_links = JSON.parse(rest_get("/rest/api/3/issue/#{key}/remotelink", auth))
+  rescue StandardError => e
+    note("could not get web links: #{e.message}")
+  end
+end
+
+mrs = merge_requests(key)
+
+FileUtils.mkdir_p(dir)
+File.write(File.join(dir, 'ticket.md'), ticket_md(data, mrs, remote_links, names))
+File.write(File.join(dir, 'comments.md'), comments_md(data))
+
+unless attachments.empty?
+  if auth
+    FileUtils.mkdir_p(File.join(dir, 'attachments'))
+    failed = attachments.count do |a|
+      File.binwrite(File.join(dir, 'attachments', names[a['id']]), rest_get("/rest/api/3/attachment/content/#{a['id']}", auth))
+      false
+    rescue StandardError => e
+      note("could not download #{a['filename']}: #{e.message}")
+      true
+    end
+    note("#{failed} of #{attachments.size} attachments failed") if failed.positive?
+  else
+    note("#{attachments.size} attachments not downloaded: no API token (JIRA_API_TOKEN or #{TOKEN_FILE})")
+  end
+end
+
+puts dir

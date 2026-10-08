@@ -12,8 +12,10 @@
 # download attachments or read web links, so for those the script goes to the REST API with
 # an API token from $JIRA_API_TOKEN, or else ~/notes/.jira-api-token (the one
 # enhance_jira_links uses). The email comes from $JIRA_EMAIL, ~/notes/.jira-api-email or the
-# account acli is logged in as. Without a token the attachments are only listed. Merge requests are the ones on gitlab.garaio-rem.com that
-# name the ticket in their title or description, found through glab.
+# account acli is logged in as. Without a token the attachments are only listed. Merge requests
+# are the ones in the ticket's Development panel, which also needs the token; without it they
+# are the ones on gitlab.garaio-rem.com that name the ticket in their title or description,
+# found through glab.
 
 # frozen_string_literal: true
 
@@ -199,6 +201,22 @@ def rest_get(path, auth, limit = 5)
   end
 end
 
+# The Development panel's merge requests, from Jira's dev-status API. That API wants the
+# instance type (oAuth-gitlab-jira-connect-gitlab.com) as applicationType, so the summary
+# comes first to name them.
+def jira_merge_requests(id, auth)
+  summary = JSON.parse(rest_get("/rest/dev-status/latest/issue/summary?issueId=#{id}", auth))
+  types = summary.dig('summary', 'pullrequest', 'byInstanceType')&.keys || []
+  types.flat_map do |type|
+    detail = JSON.parse(rest_get("/rest/dev-status/latest/issue/detail?issueId=#{id}" \
+                                 "&applicationType=#{URI.encode_www_form_component(type)}&dataType=pullrequest", auth))
+    (detail['detail'] || []).flat_map { |d| d['pullRequests'] || [] }.map do |pr|
+      { 'iid' => pr['id'].to_s[/!(\d+)\z/, 1] || pr['id'], 'title' => pr['name'], 'web_url' => pr['url'],
+        'state' => pr['status'].to_s.downcase, 'source_branch' => pr.dig('source', 'branch') }
+    end
+  end
+end
+
 def merge_requests(key)
   out, err, ok = run('glab', 'api', '--hostname', GITLAB,
                      "merge_requests?scope=all&search=#{key}&in=title,description&per_page=100")
@@ -326,7 +344,15 @@ if auth
   end
 end
 
-mrs = merge_requests(key)
+mrs = nil
+if auth
+  begin
+    mrs = jira_merge_requests(data['id'], auth)
+  rescue StandardError => e
+    note("could not get merge requests from Jira, asking GitLab: #{e.message}")
+  end
+end
+mrs ||= merge_requests(key)
 
 FileUtils.mkdir_p(dir)
 File.write(File.join(dir, 'ticket.md'), ticket_md(data, mrs, remote_links, names))

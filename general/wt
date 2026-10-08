@@ -6,6 +6,7 @@
 #   wt                              in a tree: that tree, its repos, what each has checked
 #                                   out and its git status; anywhere else: every tree
 #   wt --name                       the name of the tree you are in, on its own
+#   wt --root-path                  where the tree you are in lives, on its own
 #   wt list                      l  every tree name
 #   wt list-repos               lr  every tree, its repos, what each has checked out, and
 #                                   whether it has changed or untracked files. Each tree and
@@ -687,6 +688,14 @@ def cmd_name(config)
   puts here
 end
 
+# Where the tree the cwd is in lives, for a script to cd to before it works across the tree.
+def cmd_root_path(config)
+  here = current_tree(config)
+  die 'not in a tree' unless here
+
+  puts File.join(config.root, here)
+end
+
 def cmd_default(config, args)
   die 'too many arguments; see wt --help' unless args.empty?
 
@@ -705,19 +714,21 @@ if argv.include?('-h') || argv.include?('--help')
 end
 
 flags, args = argv.partition { |arg| arg.start_with?('-') }
-unknown = flags - %w[--all --force --name]
+unknown = flags - %w[--all --force --name --root-path]
 die "unknown option: #{unknown.first}; see wt --help" unless unknown.empty?
 
 all = flags.include?('--all')
 force = flags.include?('--force')
 name = flags.include?('--name')
+root_path = flags.include?('--root-path')
 
 command = args.shift
 command = ALIASES.fetch(command, command)
 die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
 die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
 die '--force is for remove and reset-to-head' if force && !%w[remove reset-to-head].include?(command)
-die '--name goes on its own' if name && !(command.nil? && args.empty?)
+die '--name goes on its own' if name && !(command.nil? && args.empty? && !root_path)
+die '--root-path goes on its own' if root_path && !(command.nil? && args.empty?)
 
 if command == 'init'
   cmd_init(args)
@@ -727,7 +738,11 @@ end
 config = load_config
 
 case command
-when nil then name ? cmd_name(config) : cmd_default(config, args)
+when nil
+  if name then cmd_name(config)
+  elsif root_path then cmd_root_path(config)
+  else cmd_default(config, args)
+  end
 when 'list' then trees(config).each { |tree| puts tree }
 when 'list-repos' then print_trees(config, trees(config))
 when 'path' then cmd_path(config, args)

@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# dclaude — run claude for the tree under dtach, sandboxed or on the host, so it outlives the
+# terminal it was started from: detach with Ctrl-Q, close the terminal, kill the shell you
+# attached from, and claude keeps going. Works in a tree of the wt layout; the sessions
+# belong to the tree.
+#
+#   dclaude sb [CLAUDE-ARGS...]       a new session in the sandbox: ./agent-sandbox/claude
+#                                     <tree> CLAUDE-ARGS, run from the tree's root, attached
+#                                     right away
+#   dclaude h [CLAUDE-ARGS...]        a new session on the host: plain claude CLAUDE-ARGS, the
+#                                     same way
+#   dclaude --list                -l  the tree's sessions of both kinds, numbered as one
+#                                     list: sb or h, when it was started, how many terminals
+#                                     are attached and the CLAUDE-ARGS it was given
+#   dclaude --attach [INDEX]      -a  attach to the session numbered INDEX in --list, sb or h
+#                                     alike; with no INDEX, the one session there is
+#   dclaude --attach --next    -a -n  attach to the oldest session no terminal is attached
+#                                     to; with none, do nothing
+#
+# The sockets live in <tree>/.dtach-sockets/. One whose dtach is gone — killed rather than
+# ended — is dropped the next time the sessions are looked at.
+
+set -uo pipefail
+
+die() { printf 'dclaude: %s\n' "$1" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
+
+# A session's socket, when the dtach behind it is still listening there — ss is the one place
+# that says, and it names the dtach as well. Field 5 is the socket path either way.
+listener_pid() {
+  ss -xlpH | awk -v path="$1" '$5 == path { if (match($0, /pid=[0-9]+/)) print substr($0, RSTART + 4, RLENGTH - 4) }'
+}
+
+# How many terminals have the session open: every one is a connection dtach accepted on the
+# socket.
+attached_count() {
+  ss -xH | awk -v path="$1" '$5 == path { n++ } END { print n + 0 }'
+}
+
+# The tree's sessions, oldest first, one socket path per line. The names sort by when they
+# were started, so the order — and with it a number from --list — holds still while sessions
+# come and go after it. That is byte order: a locale's collation skips the . and - in them.
+sessions() {
+  local LC_COLLATE=C sock
+  for sock in "$sockets"/*.sock; do
+    [[ -S $sock ]] || continue
+    if [[ -z $(listener_pid "$sock") ]]; then
+      rm -f "$sock"
+      continue
+    fi
+    printf '%s\n' "$sock"
+  done
+}
+
+# A socket's name is when the session was started and its kind: 20261008-130501[.2]-sb.sock.
+# These two read it back.
+started() {
+  local name=${1##*/}
+  printf '%s-%s-%s %s:%s:%s\n' "${name:0:4}" "${name:4:2}" "${name:6:2}" "${name:9:2}" "${name:11:2}" "${name:13:2}"
+}
+
+kind() {
+  local name=${1##*/}
+  name=${name%.sock}
+  printf '%s\n' "${name##*-}"
+}
+
+# The CLAUDE-ARGS a session was given: the dtach's own command line, minus the dtach part and
+# the claude of its kind in front.
+args_of() {
+  local args
+  args=$(ps -o args= -p "$(listener_pid "$1")" 2>/dev/null) || return
+  args=${args#* -r * }
+  case $(kind "$1") in
+    sb) args=${args#./agent-sandbox/claude "$tree"} ;;
+    h) args=${args#claude} ;;
+  esac
+  printf '%s\n' "${args# }"
+}
+
+# The sessions, numbered: the one listing --list prints and an --attach that cannot tell
+# which one is meant shows.
+print_sessions() {
+  local i=0 sock line args
+  for sock in "$@"; do
+    i=$((i + 1))
+    line=$(printf '%2d  %-2s  %s  %s attached' "$i" "$(kind "$sock")" "$(started "$sock")" "$(attached_count "$sock")")
+    args=$(args_of "$sock")
+    printf '%s%s\n' "$line" "${args:+  $args}"
+  done
+}
+
+list() {
+  mapfile -t found < <(sessions)
+  [[ ${#found[@]} -gt 0 ]] || { printf 'no sessions in %s\n' "$root"; return; }
+
+  print_sessions "${found[@]}"
+}
+
+# Run the dtach that holds the terminal, then hand the terminal back the way the shell wants
+# it. Detaching leaves behind whatever modes claude switched on — mouse tracking above all,
+# which has the terminal type a report into the prompt for every move of the mouse — so they
+# go off again here: mouse tracking in all its encodings, focus reports, bracketed paste, the
+# kitty and xterm keyboard extensions, the alternate screen, a hidden cursor.
+attached() {
+  "$@"
+  local status=$?
+  [[ -t 1 ]] && printf '\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l\e[?1004l\e[?2004l\e[<u\e[>4;0m\e[?1049l\e[?25h'
+  exit $status
+}
+
+# The oldest session no terminal has open — picking up where a closed terminal left off. With
+# every session taken, or none at all, there is nothing to do, and that is not an error.
+attach_next() {
+  local sock
+  # The list comes in on fd 3: stdin stays the terminal, which dtach attaches.
+  while read -r sock <&3; do
+    if [[ $(attached_count "$sock") -eq 0 ]]; then
+      attached dtach -a "$sock" -e '^q' -r ctrl_l
+    fi
+  done 3< <(sessions)
+  printf 'no session without a terminal in %s\n' "$root" >&2
+}
+
+attach() {
+  mapfile -t found < <(sessions)
+  [[ ${#found[@]} -gt 0 ]] || die "no sessions in $root"
+
+  local index=${1:-}
+  if [[ -z $index ]]; then
+    if [[ ${#found[@]} -gt 1 ]]; then
+      printf 'dclaude: %s sessions — say which: dclaude --attach INDEX\n' "${#found[@]}" >&2
+      print_sessions "${found[@]}" >&2
+      exit 1
+    fi
+    index=1
+  fi
+  [[ $index =~ ^[0-9]+$ ]] && ((index >= 1 && index <= ${#found[@]})) ||
+    die "no session numbered $index — see dclaude --list"
+
+  attached dtach -a "${found[index - 1]}" -e '^q' -r ctrl_l
+}
+
+# A fresh socket for a session of the given kind, named for now; a second session started in
+# the same second, of either kind, gets a .2 — after the first, the way the names sort. The
+# command comes in after the kind, as it is to run from the tree's root.
+start() {
+  local kind=$1
+  shift
+  mkdir -p "$sockets" || die "can't create $sockets"
+
+  local base stamp sock n=2
+  base=$(date +%Y%m%d-%H%M%S)
+  stamp=$base
+  while compgen -G "$sockets/$stamp-*.sock" >/dev/null; do
+    stamp=$base.$n
+    n=$((n + 1))
+  done
+  sock=$sockets/$stamp-$kind.sock
+  # A unix socket path has 108 bytes, terminator included; past that the kernel cuts it, and
+  # ss would name a socket --list can no longer tell is alive.
+  [[ ${#sock} -lt 108 ]] || die "$sock is too long for a unix socket"
+
+  cd "$root" || die "can't cd to $root"
+  attached dtach -c "$sock" -e '^q' -r ctrl_l "$@"
+}
+
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+
+command -v dtach >/dev/null || die "dtach is not installed — sudo apt install dtach"
+root=$(wt --root-path) || exit 1
+tree=$(wt --name) || exit 1
+sockets=$root/.dtach-sockets
+
+case ${1:-} in
+  -l | --list)
+    [[ $# -eq 1 ]] || die "--list takes no arguments; see dclaude --help"
+    list
+    ;;
+  -a | --attach)
+    [[ $# -le 2 ]] || die "--attach takes one INDEX or --next at most; see dclaude --help"
+    case ${2:-} in
+      -n | --next) attach_next ;;
+      *) attach "${2:-}" ;;
+    esac
+    ;;
+  sb)
+    shift
+    [[ -x $root/agent-sandbox/claude ]] || die "no $root/agent-sandbox/claude"
+    start sb ./agent-sandbox/claude "$tree" "$@"
+    ;;
+  h)
+    shift
+    command -v claude >/dev/null || die "no claude on PATH"
+    start h claude "$@"
+    ;;
+  '') die "say sb or h to start a session, or --list / --attach; see dclaude --help" ;;
+  *) die "unknown command: $1; see dclaude --help" ;;
+esac

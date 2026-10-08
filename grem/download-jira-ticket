@@ -7,6 +7,7 @@
 #                               items, merge requests and the list of attachments
 #   ISSUE-NUMBER/comments.md    every comment, oldest first
 #   ISSUE-NUMBER/attachments/   every attachment, one file each
+#   ISSUE-NUMBER/SUBTASK/       each subtask, the same way
 #
 # The ticket comes through acli, which has to be logged in (acli jira auth login). acli can't
 # download attachments or read web links, so for those the script goes to the REST API with
@@ -263,7 +264,8 @@ def linked_items(fields, remote_links)
     lines.unshift("- parent [#{parent['key']}](https://#{SITE}/browse/#{parent['key']}): #{parent.dig('fields', 'summary')}")
   end
   (fields['subtasks'] || []).each do |sub|
-    lines << "- subtask [#{sub['key']}](https://#{SITE}/browse/#{sub['key']}): #{sub.dig('fields', 'summary')}"
+    lines << "- subtask [#{sub['key']}](https://#{SITE}/browse/#{sub['key']}): #{sub.dig('fields', 'summary')} " \
+             "([here](#{sub['key']}/ticket.md))"
   end
   (remote_links || []).each do |link|
     object = link['object'] || {}
@@ -318,6 +320,58 @@ def comments_md(data)
   "# #{data['key']}: comments\n\n#{body.empty? ? "_none_\n" : body.join("\n")}"
 end
 
+# --- Downloading -------------------------------------------------------------------------
+
+# Writes the ticket into dir, and each of its subtasks into a folder of its own inside it.
+def download(key, dir, auth)
+  data = issue(key)
+  attachments = data.dig('fields', 'attachment') || []
+  names = attachment_names(attachments)
+
+  remote_links = nil
+  if auth
+    begin
+      remote_links = JSON.parse(rest_get("/rest/api/3/issue/#{key}/remotelink", auth))
+    rescue StandardError => e
+      note("#{key}: could not get web links: #{e.message}")
+    end
+  end
+
+  mrs = nil
+  if auth
+    begin
+      mrs = jira_merge_requests(data['id'], auth)
+    rescue StandardError => e
+      note("#{key}: could not get merge requests from Jira, asking GitLab: #{e.message}")
+    end
+  end
+  mrs ||= merge_requests(key)
+
+  FileUtils.mkdir_p(dir)
+  File.write(File.join(dir, 'ticket.md'), ticket_md(data, mrs, remote_links, names))
+  File.write(File.join(dir, 'comments.md'), comments_md(data))
+
+  unless attachments.empty?
+    if auth
+      FileUtils.mkdir_p(File.join(dir, 'attachments'))
+      failed = attachments.count do |a|
+        File.binwrite(File.join(dir, 'attachments', names[a['id']]), rest_get("/rest/api/3/attachment/content/#{a['id']}", auth))
+        false
+      rescue StandardError => e
+        note("#{key}: could not download #{a['filename']}: #{e.message}")
+        true
+      end
+      note("#{key}: #{failed} of #{attachments.size} attachments failed") if failed.positive?
+    else
+      note("#{key}: #{attachments.size} attachments not downloaded: no API token (JIRA_API_TOKEN or #{TOKEN_FILE})")
+    end
+  end
+
+  (data.dig('fields', 'subtasks') || []).each do |sub|
+    download(sub['key'], File.join(dir, sub['key']), auth)
+  end
+end
+
 # --- Main --------------------------------------------------------------------------------
 
 if ARGV.empty? || %w[-h --help help].include?(ARGV.first)
@@ -330,48 +384,8 @@ key = ARGV.first[/[A-Z][A-Z0-9]+-\d+/i]&.upcase or die("not an issue number: #{A
 dir = File.join(Dir.pwd, key)
 die("#{key} already exists here") if File.exist?(dir)
 
-data = issue(key)
 auth = credentials
-attachments = data.dig('fields', 'attachment') || []
-names = attachment_names(attachments)
 
-remote_links = nil
-if auth
-  begin
-    remote_links = JSON.parse(rest_get("/rest/api/3/issue/#{key}/remotelink", auth))
-  rescue StandardError => e
-    note("could not get web links: #{e.message}")
-  end
-end
-
-mrs = nil
-if auth
-  begin
-    mrs = jira_merge_requests(data['id'], auth)
-  rescue StandardError => e
-    note("could not get merge requests from Jira, asking GitLab: #{e.message}")
-  end
-end
-mrs ||= merge_requests(key)
-
-FileUtils.mkdir_p(dir)
-File.write(File.join(dir, 'ticket.md'), ticket_md(data, mrs, remote_links, names))
-File.write(File.join(dir, 'comments.md'), comments_md(data))
-
-unless attachments.empty?
-  if auth
-    FileUtils.mkdir_p(File.join(dir, 'attachments'))
-    failed = attachments.count do |a|
-      File.binwrite(File.join(dir, 'attachments', names[a['id']]), rest_get("/rest/api/3/attachment/content/#{a['id']}", auth))
-      false
-    rescue StandardError => e
-      note("could not download #{a['filename']}: #{e.message}")
-      true
-    end
-    note("#{failed} of #{attachments.size} attachments failed") if failed.positive?
-  else
-    note("#{attachments.size} attachments not downloaded: no API token (JIRA_API_TOKEN or #{TOKEN_FILE})")
-  end
-end
+download(key, dir, auth)
 
 puts dir

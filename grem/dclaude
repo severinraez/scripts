@@ -16,6 +16,8 @@
 #                                     alike; with no INDEX, the one session there is
 #   dclaude --attach --next    -a -n  attach to the oldest session no terminal is attached
 #                                     to; with none, do nothing
+#   dclaude --terminate INDEX     -t  end the session numbered INDEX in --list, sb or h alike —
+#                                     only one no terminal is attached to
 #
 # The sockets live in <tree>/.dtach-sockets/. One whose dtach is gone — killed rather than
 # ended — is dropped the next time the sessions are looked at.
@@ -142,6 +144,30 @@ attach() {
   attached dtach -a "${found[index - 1]}" -e '^q' -r ctrl_l
 }
 
+# End a session the way closing its terminal would: the dtach goes, the pty with it, and
+# claude gets its hangup. One a terminal is attached to is someone's — that is left alone.
+terminate() {
+  local index=$1
+  mapfile -t found < <(sessions)
+  [[ ${#found[@]} -gt 0 ]] || die "no sessions in $root"
+  [[ $index =~ ^[0-9]+$ ]] && ((index >= 1 && index <= ${#found[@]})) ||
+    die "no session numbered $index — see dclaude --list"
+
+  local sock=${found[index - 1]} pid n
+  n=$(attached_count "$sock")
+  ((n == 0)) || die "session $index has $n terminal(s) attached — detach first"
+  pid=$(listener_pid "$sock")
+  [[ -n $pid ]] || return 0
+  kill "$pid" 2>/dev/null || die "can't kill dtach $pid"
+
+  # dtach drops its socket on the way out; give it a few seconds to.
+  for _ in {1..50}; do
+    [[ -z $(listener_pid "$sock") ]] && { rm -f "$sock"; return 0; }
+    sleep 0.1
+  done
+  die "dtach $pid is still listening on $sock"
+}
+
 # A fresh socket for a session of the given kind, named for now; a second session started in
 # the same second, of either kind, gets a .2 — after the first, the way the names sort. The
 # command comes in after the kind, as it is to run from the tree's root.
@@ -185,6 +211,10 @@ case ${1:-} in
       *) attach "${2:-}" ;;
     esac
     ;;
+  -t | --terminate)
+    [[ $# -eq 2 ]] || die "--terminate takes one INDEX; see dclaude --help"
+    terminate "$2"
+    ;;
   sb)
     shift
     [[ -x $root/agent-sandbox/claude ]] || die "no $root/agent-sandbox/claude"
@@ -195,6 +225,6 @@ case ${1:-} in
     command -v claude >/dev/null || die "no claude on PATH"
     start h claude "$@"
     ;;
-  '') die "say sb or h to start a session, or --list / --attach; see dclaude --help" ;;
+  '') die "say sb or h to start a session, or --list / --attach / --terminate; see dclaude --help" ;;
   *) die "unknown command: $1; see dclaude --help" ;;
 esac

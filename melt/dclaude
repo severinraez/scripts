@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# dclaude for melt — general/dclaude with the sandbox melt starts claude in:
+# dev-vm/bin/sandbox claude, in the dev VM. See dclaude --help.
+
+DCLAUDE_SANDBOX='./dev-vm/bin/sandbox claude' exec "$(dirname "$(readlink -f "$0")")/../general/dclaude" "$@"

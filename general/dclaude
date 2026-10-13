@@ -16,6 +16,10 @@
 #                                     alike; with no INDEX, the one session there is
 #   dclaude --attach --next    -a -n  attach to the oldest session no terminal is attached
 #                                     to; with none, do nothing
+#   dclaude --try-next                --attach --next for a shell that stays either way, a
+#                                     Zed terminal thread's terminal_init_command say: no
+#                                     session without a terminal, or no tree here at all,
+#                                     and it says so and leaves you the shell
 #   dclaude --terminate INDEX     -t  end the session numbered INDEX in --list, sb or h alike —
 #                                     only one no terminal is attached to
 #
@@ -130,6 +134,26 @@ attach_next() {
   printf 'no session without a terminal in %s\n' "$root" >&2
 }
 
+# --next that never fails: the shell it runs in is the terminal either way. Outside a tree there
+# is nothing to attach, and that is said, not died of.
+try_next() {
+  if ! command -v dtach >/dev/null || ! root=$(wt --root-path 2>/dev/null); then
+    printf 'dclaude: no tree here — no session to attach\n'
+    exit 0
+  fi
+  sockets=$root/.dtach-sockets
+
+  local sock n=0
+  while read -r sock <&3; do
+    if [[ $(attached_count "$sock") -eq 0 ]]; then
+      attached dtach -a "$sock" -e '^q' -r ctrl_l
+    fi
+    n=$((n + 1))
+  done 3< <(sessions)
+  printf 'dclaude: no session without a terminal in %s — %d attached elsewhere\n' "$root" "$n"
+  exit 0
+}
+
 attach() {
   mapfile -t found < <(sessions)
   [[ ${#found[@]} -gt 0 ]] || die "no sessions in $root"
@@ -197,7 +221,13 @@ start() {
   attached dtach -c "$sock" -e '^q' -r ctrl_l "$@"
 }
 
-case ${1:-} in -h | --help) usage; exit 0 ;; esac
+case ${1:-} in
+  -h | --help) usage; exit 0 ;;
+  --try-next)
+    [[ $# -eq 1 ]] || die "--try-next takes no arguments; see dclaude --help"
+    try_next
+    ;;
+esac
 
 command -v dtach >/dev/null || die "dtach is not installed — sudo apt install dtach"
 root=$(wt --root-path) || exit 1

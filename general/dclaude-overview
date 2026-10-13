@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# dclaude-overview — the dclaude sessions of every tree under a worktree root, one block per
+# tree: its name, then what 'dclaude --list' says there, so the numbers are the ones --attach
+# and --terminate take in that tree. The trees come from 'wt list', each one's directory from
+# 'wt path TREE'.
+#
+#   dclaude-overview [DIR]                        every tree's sessions
+#   dclaude-overview [DIR] --cleanup TREE-SET -c  end every session of TREE-SET, a tree
+#                                                 'wt list' names, no terminal is attached
+#                                                 to, with 'dclaude --terminate', saying
+#                                                 which
+#
+# DIR is the worktree directory the trees live in, ~/dev/trees say; wt runs there, so that is
+# also where it looks for its config — the first .wt.yml at or above it. Left out, DIR is the
+# cwd.
+#
+# dclaude is the one on PATH, the profile's, so the sessions' CLAUDE-ARGS come out without its
+# sandbox command in front.
+
+set -uo pipefail
+
+die() { printf 'dclaude-overview: %s\n' "$1" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
+
+dir=
+cleanup=
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+    -c | --cleanup)
+      [[ -n ${2:-} ]] || die "--cleanup wants a TREE-SET; see dclaude-overview --help"
+      [[ -z $cleanup ]] || die "one --cleanup at a time"
+      cleanup=$2
+      shift 2
+      ;;
+    -*) die "unknown option: $1; see dclaude-overview --help" ;;
+    *)
+      [[ -z $dir ]] || die "takes at most one directory; see dclaude-overview --help"
+      dir=$1
+      shift
+      ;;
+  esac
+done
+
+dir=${dir:-$PWD}
+[[ -d $dir ]] || die "no such directory: $dir"
+cd "$dir" || die "can't enter $dir"
+
+command -v wt >/dev/null || die "wt is not on PATH"
+command -v dclaude >/dev/null || die "dclaude is not on PATH"
+
+listing=$(wt list) || die "wt list failed in $dir"
+[[ -n $listing ]] || die "no trees under $dir"
+
+# --cleanup: the unattached sessions as 'dclaude --list --unattached' numbers them, ended from
+# the highest number down — ending one renumbers those after it, never those before. One that
+# got a terminal since the listing is left alone; dclaude --terminate refuses it.
+if [[ -n $cleanup ]]; then
+  grep -qxF "$cleanup" <<<"$listing" || die "no tree set named $cleanup under $dir"
+  tree_path=$(wt path "$cleanup") || die "wt path $cleanup failed"
+  cd "$tree_path" || die "can't enter $tree_path"
+
+  unattached=$(dclaude --list --unattached) || exit 1
+  mapfile -t indexes < <(awk '$1 ~ /^[0-9]+$/ { print $1 }' <<<"$unattached" | sort -rn)
+  if [[ ${#indexes[@]} -eq 0 ]]; then
+    printf '%s\n' "$unattached"
+    exit 0
+  fi
+
+  status=0
+  for index in "${indexes[@]}"; do
+    line=$(awk -v i="$index" '$1 == i' <<<"$unattached")
+    if dclaude --terminate "$index"; then
+      printf 'ended %s\n' "${line# }"
+    else
+      status=1
+    fi
+  done
+  exit $status
+fi
+
+# Natural order, so tree-9 comes before tree-10 rather than after it.
+mapfile -t trees < <(sort -V <<<"$listing")
+
+# Every tree's listing at once, each into its own file — dclaude --list asks ss and ps per
+# session, and the trees don't wait on each other for that. The files are read back in tree
+# order once all are in; a listing that failed leaves a .failed beside its output.
+out_dir=$(mktemp -d) || die "can't make a temp directory"
+trap 'rm -rf "$out_dir"' EXIT
+
+for i in "${!trees[@]}"; do
+  (
+    # dclaude finds the tree from where it runs, so it runs in the tree's own directory.
+    tree_path=$(wt path "${trees[i]}") && cd "$tree_path" && dclaude --list ||
+      touch "$out_dir/$i.failed"
+  ) >"$out_dir/$i" 2>&1 &
+done
+wait
+
+status=0
+for i in "${!trees[@]}"; do
+  printf '%s\n' "${trees[i]}"
+  sed 's/^/  /' "$out_dir/$i"
+  [[ -e $out_dir/$i.failed ]] && status=1
+done
+
+exit $status

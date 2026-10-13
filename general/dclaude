@@ -12,6 +12,8 @@
 #   dclaude --list                -l  the tree's sessions of both kinds, numbered as one
 #                                     list: sb or h, when it was started, how many terminals
 #                                     are attached and the CLAUDE-ARGS it was given
+#   dclaude --list --unattached -l -u  just the sessions no terminal is attached to, under
+#                                     the numbers --list gives them
 #   dclaude --attach [INDEX]      -a  attach to the session numbered INDEX in --list, sb or h
 #                                     alike; with no INDEX, the one session there is
 #   dclaude --attach --next    -a -n  attach to the oldest session no terminal is attached
@@ -38,16 +40,40 @@ die() { printf 'dclaude: %s\n' "$1" >&2; exit 1; }
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
 # A session's socket, when the dtach behind it is still listening there — ss is the one place
-# that says, and it names the dtach as well. Field 5 is the socket path either way.
-listener_pid() {
+# that says, and it names the dtach as well. Field 5 is the socket path either way. This one
+# asks ss now; the lookups below read what probe saw.
+listener_pid_now() {
   ss -xlpH | awk -v path="$1" '$5 == path { if (match($0, /pid=[0-9]+/)) print substr($0, RSTART + 4, RLENGTH - 4) }'
 }
 
-# How many terminals have the session open: every one is a connection dtach accepted on the
-# socket.
-attached_count() {
-  ss -xH | awk -v path="$1" '$5 == path { n++ } END { print n + 0 }'
+# What ss and ps say about the tree's sockets, asked once: every ss call lists every socket
+# there is, which costs far more than the one socket wanted from it — so each is run once for
+# all of them, not once per session per question. Filled in the shell itself, ahead of any
+# sessions in a <( ), which sees it from there.
+#   listeners  socket path -> pid of the dtach listening on it
+#   conns      socket path -> how many terminals have it open: every one is a connection dtach
+#              accepted on the socket
+#   cmdlines   pid -> that dtach's command line
+declare -A listeners=() conns=() cmdlines=()
+probe() {
+  listeners=() conns=() cmdlines=()
+  local pid path n args
+  # The pid goes first, so a path is the rest of the line whatever it holds.
+  while read -r pid path; do
+    listeners[$path]=$pid
+  done < <(ss -xlpH | awk -v dir="$sockets/" 'index($5, dir) == 1 && match($0, /pid=[0-9]+/) { print substr($0, RSTART + 4, RLENGTH - 4), $5 }')
+  while read -r n path; do
+    conns[$path]=$n
+  done < <(ss -xH | awk -v dir="$sockets/" 'index($5, dir) == 1 { n[$5]++ } END { for (p in n) print n[p], p }')
+  [[ ${#listeners[@]} -gt 0 ]] || return 0
+  while read -r pid args; do
+    cmdlines[$pid]=$args
+  done < <(IFS=,; ps -o pid=,args= -p "${listeners[*]}")
 }
+
+listener_pid() { printf '%s\n' "${listeners[$1]:-}"; }
+
+attached_count() { printf '%s\n' "${conns[$1]:-0}"; }
 
 # The tree's sessions, oldest first, one socket path per line. The names sort by when they
 # were started, so the order — and with it a number from --list — holds still while sessions
@@ -80,8 +106,10 @@ kind() {
 # The CLAUDE-ARGS a session was given: the dtach's own command line, minus the dtach part and
 # the claude of its kind in front.
 args_of() {
-  local args
-  args=$(ps -o args= -p "$(listener_pid "$1")" 2>/dev/null) || return
+  local pid args
+  pid=$(listener_pid "$1")
+  [[ -n $pid && -n ${cmdlines[$pid]:-} ]] || return
+  args=${cmdlines[$pid]}
   args=${args#* -r * }
   case $(kind "$1") in
     sb) args=${args#"${sandbox[*]}"} ;;
@@ -92,21 +120,41 @@ args_of() {
 
 # The sessions, numbered: the one listing --list prints and an --attach that cannot tell
 # which one is meant shows.
+print_session() {
+  local line args
+  line=$(printf '%2d  %-2s  %s  %s attached' "$1" "$(kind "$2")" "$(started "$2")" "$(attached_count "$2")")
+  args=$(args_of "$2")
+  printf '%s%s\n' "$line" "${args:+  $args}"
+}
+
 print_sessions() {
-  local i=0 sock line args
+  local i=0 sock
   for sock in "$@"; do
     i=$((i + 1))
-    line=$(printf '%2d  %-2s  %s  %s attached' "$i" "$(kind "$sock")" "$(started "$sock")" "$(attached_count "$sock")")
-    args=$(args_of "$sock")
-    printf '%s%s\n' "$line" "${args:+  $args}"
+    print_session "$i" "$sock"
   done
 }
 
+# --list, all of them or just the ones no terminal is attached to; those keep the numbers
+# they have among all, which are what --attach and --terminate take.
 list() {
+  local unattached_only=$1
+  probe
   mapfile -t found < <(sessions)
   [[ ${#found[@]} -gt 0 ]] || { printf 'no sessions in %s\n' "$root"; return; }
 
-  print_sessions "${found[@]}"
+  if (( !unattached_only )); then
+    print_sessions "${found[@]}"
+    return
+  fi
+
+  local i shown=0
+  for i in "${!found[@]}"; do
+    [[ $(attached_count "${found[i]}") -eq 0 ]] || continue
+    print_session $((i + 1)) "${found[i]}"
+    shown=1
+  done
+  (( shown )) || printf 'no session without a terminal in %s\n' "$root"
 }
 
 # Run the dtach that holds the terminal, then hand the terminal back the way the shell wants
@@ -125,6 +173,7 @@ attached() {
 # every session taken, or none at all, there is nothing to do, and that is not an error.
 attach_next() {
   local sock
+  probe
   # The list comes in on fd 3: stdin stays the terminal, which dtach attaches.
   while read -r sock <&3; do
     if [[ $(attached_count "$sock") -eq 0 ]]; then
@@ -144,6 +193,7 @@ try_next() {
   sockets=$root/.dtach-sockets
 
   local sock n=0
+  probe
   while read -r sock <&3; do
     if [[ $(attached_count "$sock") -eq 0 ]]; then
       attached dtach -a "$sock" -e '^q' -r ctrl_l
@@ -155,6 +205,7 @@ try_next() {
 }
 
 attach() {
+  probe
   mapfile -t found < <(sessions)
   [[ ${#found[@]} -gt 0 ]] || die "no sessions in $root"
 
@@ -177,6 +228,7 @@ attach() {
 # claude gets its hangup. One a terminal is attached to is someone's — that is left alone.
 terminate() {
   local index=$1
+  probe
   mapfile -t found < <(sessions)
   [[ ${#found[@]} -gt 0 ]] || die "no sessions in $root"
   [[ $index =~ ^[0-9]+$ ]] && ((index >= 1 && index <= ${#found[@]})) ||
@@ -191,7 +243,7 @@ terminate() {
 
   # dtach drops its socket on the way out; give it a few seconds to.
   for _ in {1..50}; do
-    [[ -z $(listener_pid "$sock") ]] && { rm -f "$sock"; return 0; }
+    [[ -z $(listener_pid_now "$sock") ]] && { rm -f "$sock"; return 0; }
     sleep 0.1
   done
   die "dtach $pid is still listening on $sock"
@@ -230,16 +282,25 @@ case ${1:-} in
 esac
 
 command -v dtach >/dev/null || die "dtach is not installed — sudo apt install dtach"
+# wt is Ruby, and starting it is most of what a dclaude takes — so the name is asked for
+# alongside the root rather than after it. Only the root's wt says what went wrong; the name's
+# would say it again, and an empty name is its failure.
+exec 3< <(wt --name 2>/dev/null)
 root=$(wt --root-path) || exit 1
-tree=$(wt --name) || exit 1
+tree=$(cat <&3)
+exec 3<&-
+[[ -n $tree ]] || exit 1
 sockets=$root/.dtach-sockets
 # The profile's sandbox command, word by word, with the tree's name in it.
 read -ra sandbox <<<"${DCLAUDE_SANDBOX//\{tree\}/$tree}"
 
 case ${1:-} in
   -l | --list)
-    [[ $# -eq 1 ]] || die "--list takes no arguments; see dclaude --help"
-    list
+    case $#:${2:-} in
+      1:) list 0 ;;
+      2:-u | 2:--unattached) list 1 ;;
+      *) die "--list takes --unattached at most; see dclaude --help" ;;
+    esac
     ;;
   -a | --attach)
     [[ $# -le 2 ]] || die "--attach takes one INDEX or --next at most; see dclaude --help"

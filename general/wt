@@ -387,9 +387,19 @@ def print_trees(config, list, flat: false)
   rows.each do |tree, repos|
     line.([tree, nil], "#{index.(tree, nil)}#{tree}")
     repos.each do |name, head, work, files|
-      cells = "#{indent}#{index.(tree, name)}#{label.(tree, name).ljust(name_width)}  #{head.ljust(head_width)}  #{work.ljust(work_width)}"
-      # Dim, not a colour: it is lighter than the text around it on a dark background and on a light one.
-      cells += "  \e[2m#{fit_files(files, files_width)}\e[22m" if files_width.positive? && files.any?
+      # Dim, not a colour: it is lighter than the text around it on a dark background and on a
+      # light one. Ending it ends bold too, so the line for the cwd turns bold back on.
+      undim = [tree, name] == here ? "\e[22;1m" : "\e[22m"
+      dim = ->(text) { "\e[2m#{text}#{undim}" }
+      # A repo on origin/HEAD and a clean one are the usual case, so they step back like the
+      # files do.
+      # The padding goes outside, so the rstrip below still trims it.
+      shown_head = $stdout.tty? && head.start_with?('origin ') ? dim.(head) : head
+      shown_head += ' ' * (head_width - head.length)
+      shown_work = $stdout.tty? && work == 'clean' ? dim.(work) : work
+      shown_work += ' ' * (work_width - work.length)
+      cells = "#{indent}#{index.(tree, name)}#{label.(tree, name).ljust(name_width)}  #{shown_head}  #{shown_work}"
+      cells += "  #{dim.(fit_files(files, files_width))}" if files_width.positive? && files.any?
       line.([tree, name], cells.rstrip)
     end
   end

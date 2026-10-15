@@ -16,6 +16,9 @@
 #                                   On a terminal wide enough, wt and wt list-repos add the
 #                                   changed and untracked files, dimmed, cut short with … +N
 #                                   when they do not all fit
+#                                   wt and wt list-repos leave out the repos that are clean,
+#                                   detached on origin and so not stale; every tree stays.
+#                                   --all, or -a, shows every repo
 #   wt list-repos --flat            the same, one line each, unnumbered and unindented: a tree
 #                                   as its name, a repo as TREE/REPO, for fzf and the like to
 #                                   pick from and hand back to wt path. wt --flat too
@@ -368,8 +371,11 @@ end
 # a line picked out of the listing says where it is without the lines around it.
 MIN_FILES_WIDTH = 20
 
-def print_trees(config, list, flat: false)
+def print_trees(config, list, flat: false, quiet: true)
   rows = tree_rows(config, list)
+  if quiet
+    rows = rows.transform_values { |repos| repos.reject { |_, head, work, _| head.start_with?('origin ') && work == 'clean' } }
+  end
   numbers = numbered(config)
   here = current_spot(config)
   here = [here.first, nil] if here && !rows[here.first]&.any? { |name, *| name == here.last }
@@ -385,7 +391,13 @@ def print_trees(config, list, flat: false)
   term = terminal_width
   files_width = term ? term - (index_width + name_width + head_width + work_width + (flat ? 6 : 12)) : 0
   files_width = 0 if files_width < MIN_FILES_WIDTH
-  index = ->(tree, name) { flat ? '' : "#{numbers.dig([tree, name], 0).to_s.rjust(index_width)}  " }
+  # Dimmed like the files; the padding stays outside, and a bold line turns bold back on.
+  index = lambda do |tree, name|
+    next '' if flat
+
+    number = numbers.dig([tree, name], 0).to_s.rjust(index_width)
+    $stdout.tty? ? "\e[2m#{number}#{[tree, name] == here ? "\e[22;1m" : "\e[22m"}  " : "#{number}  "
+  end
   indent = flat ? '' : '  '
   rows.each do |tree, repos|
     line.([tree, nil], "#{index.(tree, nil)}#{tree}")
@@ -401,7 +413,7 @@ def print_trees(config, list, flat: false)
       shown_head += ' ' * (head_width - head.length)
       shown_work = $stdout.tty? && work == 'clean' ? dim.(work) : work
       shown_work += ' ' * (work_width - work.length)
-      cells = "#{indent}#{index.(tree, name)}#{label.(tree, name).ljust(name_width)}  #{shown_head}  #{shown_work}"
+      cells = "#{index.(tree, name)}#{indent}#{label.(tree, name).ljust(name_width)}  #{shown_head}  #{shown_work}"
       cells += "  #{dim.(fit_files(files, files_width))}" if files_width.positive? && files.any?
       line.([tree, name], cells.rstrip)
     end
@@ -748,13 +760,13 @@ def cmd_root_path(config)
   puts File.join(config.root, here)
 end
 
-def cmd_default(config, args, flat)
+def cmd_default(config, args, flat, quiet)
   die 'too many arguments; see wt --help' unless args.empty?
 
   here = current_tree(config)
-  return print_trees(config, [here], flat: flat) if here
+  return print_trees(config, [here], flat: flat, quiet: quiet) if here
 
-  print_trees(config, trees(config), flat: flat)
+  print_trees(config, trees(config), flat: flat, quiet: quiet)
 end
 
 # --- dispatch --------------------------------------------------------------------------
@@ -766,10 +778,10 @@ if argv.include?('-h') || argv.include?('--help')
 end
 
 flags, args = argv.partition { |arg| arg.start_with?('-') }
-unknown = flags - %w[--all --force --name --root-path --flat --dry-run -d]
+unknown = flags - %w[--all --force --name --root-path --flat --dry-run -d -a]
 die "unknown option: #{unknown.first}; see wt --help" unless unknown.empty?
 
-all = flags.include?('--all')
+all = flags.include?('--all') || flags.include?('-a')
 force = flags.include?('--force')
 name = flags.include?('--name')
 root_path = flags.include?('--root-path')
@@ -779,12 +791,13 @@ dry_run = flags.include?('--dry-run') || flags.include?('-d')
 command = args.shift
 command = ALIASES.fetch(command, command)
 die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
-die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
+die '--all is for wt, list-repos, update and update-detached' if all && !(command.nil? || %w[list-repos update update-detached].include?(command))
 die '--force is for remove and reset-to-head' if force && !%w[remove reset-to-head].include?(command)
 die '--dry-run is for clean' if dry_run && command != 'clean'
 die '--name goes on its own' if name && !(command.nil? && args.empty? && !root_path)
 die '--root-path goes on its own' if root_path && !(command.nil? && args.empty?)
 die '--flat is for wt and list-repos' if flat && !(command.nil? || command == 'list-repos')
+die '--all does not go with --name or --root-path' if all && (name || root_path)
 die '--flat does not go with --name or --root-path' if flat && (name || root_path)
 
 if command == 'init'
@@ -798,10 +811,10 @@ case command
 when nil
   if name then cmd_name(config)
   elsif root_path then cmd_root_path(config)
-  else cmd_default(config, args, flat)
+  else cmd_default(config, args, flat, !all)
   end
 when 'list' then trees(config).each { |tree| puts tree }
-when 'list-repos' then print_trees(config, trees(config), flat: flat)
+when 'list-repos' then print_trees(config, trees(config), flat: flat, quiet: !all)
 when 'path' then cmd_path(config, args)
 when 'repo-paths' then cmd_repo_paths(config, args)
 when 'main-repo-paths' then cmd_main_repo_paths(config, args)

@@ -36,6 +36,9 @@
 #   wt reset-to-head [TREE]    rth  every repo there, branch or not: fetch, then detach on
 #                                   origin/HEAD. One with uncommitted changes is left alone;
 #                                   --force throws the changes away. Branches stay as they are
+#   wt clean TREE [--dry-run|-d] cl git clean -fd in every repo of TREE: untracked files and
+#                                   directories go, ignored ones stay. --dry-run, or -d, only
+#                                   lists what would go (git clean -nd)
 #   wt remove TREE [--force]    rm  take TREE and the worktrees in it away
 #   wt prune                    pr  in every repository, forget the worktrees whose
 #                                   directories are no longer there
@@ -68,7 +71,7 @@ Config = Struct.new(:path, :root, :repos)
 ALIASES = {
   'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
   'u' => 'update', 'ud' => 'update-detached', 'rth' => 'reset-to-head',
-  'rm' => 'remove', 'pr' => 'prune', 'c' => 'config', 'i' => 'init',
+  'rm' => 'remove', 'cl' => 'clean', 'pr' => 'prune', 'c' => 'config', 'i' => 'init',
   'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
 }.freeze
 
@@ -575,6 +578,25 @@ def cmd_reset_to_head(config, args, force)
   report(*across_repos(config, [tree]) { |_, path| reset_to_head(path, force) if Dir.exist?(path) })
 end
 
+# Untracked files and directories of every repo in a tree, gone — or, dry, just named.
+def cmd_clean(config, args, dry_run)
+  die 'clean takes one tree name; see wt --help' unless args.size == 1
+
+  tree = require_tree(config, args.first)
+  failed = false
+  repo_entries(config, tree).each do |name, path|
+    next unless Dir.exist?(path)
+
+    out, ok = git(path, 'clean', dry_run ? '-nd' : '-fd')
+    failed ||= !ok
+    next if out.empty? && ok
+
+    puts name
+    out.each_line { |line| puts "  #{line.rstrip}" }
+  end
+  exit 1 if failed
+end
+
 def cmd_remove(config, args, force)
   die 'remove takes one tree name; see wt --help' unless args.size == 1
 
@@ -744,7 +766,7 @@ if argv.include?('-h') || argv.include?('--help')
 end
 
 flags, args = argv.partition { |arg| arg.start_with?('-') }
-unknown = flags - %w[--all --force --name --root-path --flat]
+unknown = flags - %w[--all --force --name --root-path --flat --dry-run -d]
 die "unknown option: #{unknown.first}; see wt --help" unless unknown.empty?
 
 all = flags.include?('--all')
@@ -752,12 +774,14 @@ force = flags.include?('--force')
 name = flags.include?('--name')
 root_path = flags.include?('--root-path')
 flat = flags.include?('--flat')
+dry_run = flags.include?('--dry-run') || flags.include?('-d')
 
 command = args.shift
 command = ALIASES.fetch(command, command)
 die "unknown command: #{command}; see wt --help" unless command.nil? || COMMANDS.include?(command)
 die '--all is for update and update-detached' if all && !%w[update update-detached].include?(command)
 die '--force is for remove and reset-to-head' if force && !%w[remove reset-to-head].include?(command)
+die '--dry-run is for clean' if dry_run && command != 'clean'
 die '--name goes on its own' if name && !(command.nil? && args.empty? && !root_path)
 die '--root-path goes on its own' if root_path && !(command.nil? && args.empty?)
 die '--flat is for wt and list-repos' if flat && !(command.nil? || command == 'list-repos')
@@ -785,6 +809,7 @@ when 'add' then cmd_add(config, args)
 when 'update' then cmd_update(config, args, all)
 when 'update-detached' then cmd_update_detached(config, args, all)
 when 'reset-to-head' then cmd_reset_to_head(config, args, force)
+when 'clean' then cmd_clean(config, args, dry_run)
 when 'remove' then cmd_remove(config, args, force)
 when 'prune' then cmd_prune(config, args)
 when 'config' then print File.read(config.path)

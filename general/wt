@@ -42,7 +42,16 @@
 #   wt clean TREE [--dry-run|-d] cl git clean -fd in every repo of TREE: untracked files and
 #                                   directories go, ignored ones stay. --dry-run, or -d, only
 #                                   lists what would go (git clean -nd)
-#   wt remove TREE [--force|-f] rm  take TREE and the worktrees in it away
+#   wt archive TREE             ar  in every repo of TREE sitting detached: move the changed and
+#                                   untracked files to <worktree_root>/.archive/<YYYY-MM-DD_HH-MM-SS>/<repo>/,
+#                                   then fetch and detach on origin/HEAD like update-detached.
+#                                   A repo on a branch is left alone, work and all
+#   wt unarchive TREE NAME      ua  move the files of archive NAME back into the repos of TREE.
+#                                   A changed file replaces the file as it is on HEAD; a repo
+#                                   where anything else is already there is left alone, its
+#                                   files kept in the archive. With no arguments, every archive
+#                                   and the tree it came from
+#   wt remove TREE [--force|-f] rm take TREE and the worktrees in it away
 #   wt prune                    pr  in every repository, forget the worktrees whose
 #                                   directories are no longer there
 #   wt config                    c  the .wt.yml in force, verbatim
@@ -74,7 +83,7 @@ Config = Struct.new(:path, :root, :repos)
 ALIASES = {
   'l' => 'list', 'lr' => 'list-repos', 'p' => 'path', 'a' => 'add',
   'u' => 'update', 'ud' => 'update-detached', 'rth' => 'reset-to-head',
-  'rm' => 'remove', 'cl' => 'clean', 'pr' => 'prune', 'c' => 'config', 'i' => 'init',
+  'rm' => 'remove', 'ar' => 'archive', 'ua' => 'unarchive', 'cl' => 'clean', 'pr' => 'prune', 'c' => 'config', 'i' => 'init',
   'rp' => 'repo-paths', 'mrp' => 'main-repo-paths'
 }.freeze
 
@@ -609,6 +618,174 @@ def cmd_clean(config, args, dry_run)
   exit 1 if failed
 end
 
+# Every changed (staged or not) and untracked file of a checkout, as paths relative to it.
+# The raw -z output: git() strips, which would eat the leading space of the first status.
+def dirty_paths(path)
+  out, status = Open3.capture2('git', '-C', path, 'status', '--porcelain', '-z', '--untracked-files=all')
+  return nil unless status.success?
+
+  entries = out.split("\0")
+  paths = []
+  until entries.empty?
+    entry = entries.shift
+    paths << entry[3..]
+    entries.shift if entry[0] =~ /[RC]/ # a rename or copy carries its source as the next entry
+  end
+  paths
+end
+
+# Copy the work of one detached checkout into the archive, then take it out of the checkout:
+# tracked changes reset, untracked files cleaned. Nothing is taken out unless every file made
+# it into the archive. A deleted file has nothing to copy; the reset puts it back.
+def archive_work(path, dest)
+  paths = dirty_paths(path)
+  return ['status failed', false] unless paths
+  return nil if paths.empty?
+
+  begin
+    paths.each do |file|
+      src = File.join(path, file)
+      next unless File.symlink?(src) || File.exist?(src)
+
+      FileUtils.mkdir_p(File.dirname(File.join(dest, file)))
+      FileUtils.copy_entry(src, File.join(dest, file), true)
+    end
+  rescue SystemCallError => e
+    return ["archive failed, checkout untouched: #{e.message}", false]
+  end
+
+  _, reset_ok = git(path, 'reset', '--hard', '--quiet')
+  _, clean_ok = git(path, 'clean', '-ffd', '--quiet')
+  reset_ok && clean_ok ? ["archived #{paths.size}", true] : ["archived #{paths.size}, but clearing the checkout failed", false]
+end
+
+# Archive the work of every detached repo of a tree, then update-detached it.
+def cmd_archive(config, args)
+  die 'archive takes one tree name; see wt --help' unless args.size == 1
+
+  tree = require_tree(config, args.first)
+  stamp_dir = File.join(archive_root(config), Time.now.strftime('%Y-%m-%d_%H-%M-%S'))
+  report(*across_repos(config, [tree]) do |name, path|
+    next unless Dir.exist?(path)
+
+    plan = redetach(path)
+    next plan unless plan.is_a?(Pending)
+
+    archived = archive_work(path, File.join(stamp_dir, name))
+    # Which tree it came from, for wt unarchive to put it back; a dot file, so no repo's name.
+    File.write(File.join(stamp_dir, '.tree'), "#{tree}\n") if archived&.last
+    next plan if archived.nil?
+    next archived unless archived.last
+
+    Pending.new(path, lambda do
+      note, ok = plan.work.call
+      ["#{archived.first}, #{note}", ok]
+    end)
+  end)
+end
+
+def archive_root(config)
+  File.join(config.root, '.archive')
+end
+
+# The entries of an archived dir that would land on something already in the checkout: a dir
+# meeting a dir is fine, and looked into; so is a tracked file as it is on HEAD, which is where
+# the reset left a changed file and what the archive holds the changes to. Anything else
+# meeting anything is in the way. Paths relative to the checkout.
+def unarchive_conflicts(src, dest, replaceable, rel = '')
+  Dir.children(src).flat_map do |entry|
+    from = File.join(src, entry)
+    to = File.join(dest, entry)
+    path = "#{rel}#{entry}"
+    next [] unless File.symlink?(to) || File.exist?(to)
+    next unarchive_conflicts(from, to, replaceable, "#{path}/") if File.directory?(from) && !File.symlink?(from) && File.directory?(to) && !File.symlink?(to)
+    next [] if replaceable.include?(path)
+
+    [path]
+  end
+end
+
+# The files of a checkout an archived file may replace: tracked, and unchanged since HEAD.
+def replaceable_files(path)
+  tracked, ok = git(path, 'ls-files', '-z')
+  dirty = dirty_paths(path)
+  return nil unless ok && dirty
+
+  tracked.split("\0") - dirty
+end
+
+# Move an archived dir into the checkout, entry by entry, merging into the dirs already there.
+# Emptied dirs on the archive side go as it goes.
+def unarchive_into(src, dest)
+  Dir.children(src).each do |entry|
+    from = File.join(src, entry)
+    to = File.join(dest, entry)
+    next unarchive_into(from, to) if File.directory?(to) && !File.symlink?(to)
+
+    FileUtils.rm_f(to)
+    FileUtils.mv(from, to)
+  end
+  Dir.rmdir(src)
+end
+
+# Put one archive's files back, a repo at a time. A repo where any of them would land on a file
+# that is there is skipped whole, so nothing is overwritten and nothing half restored. The
+# archive goes once everything in it is back.
+def cmd_unarchive(config, args)
+  die 'unarchive takes a tree and an archive name; see wt --help' unless [0, 2].include?(args.size)
+
+  root = archive_root(config)
+  if args.empty?
+    names = Dir.exist?(root) ? Dir.children(root).sort : []
+    names.each do |name|
+      from = File.join(root, name, '.tree')
+      puts File.exist?(from) ? "#{name}  #{File.read(from).strip}" : name
+    end
+    return
+  end
+
+  tree, name = args
+  require_tree(config, tree)
+  dir = File.join(root, name)
+  die "no archive named #{name}" if name.include?('/') || name.start_with?('.') || !Dir.exist?(dir)
+
+  failed = false
+  notes = undotted_dirs(dir).sort.map do |repo|
+    src = File.join(dir, repo)
+    dest = File.join(config.root, tree, repo)
+    unless Dir.exist?(dest)
+      failed = true
+      next [repo, "no #{dest}, left in the archive"]
+    end
+
+    replaceable = replaceable_files(dest)
+    unless replaceable
+      failed = true
+      next [repo, 'status failed, left in the archive']
+    end
+
+    conflicts = unarchive_conflicts(src, dest, replaceable)
+    unless conflicts.empty?
+      failed = true
+      next [repo, "left in the archive, already there: #{conflicts.join(', ')}"]
+    end
+
+    count = Dir.glob('**/*', File::FNM_DOTMATCH, base: src).count { |path| !File.directory?(File.join(src, path)) }
+    unarchive_into(src, dest)
+    [repo, "restored #{count} into #{tree}"]
+  rescue SystemCallError => e
+    failed = true
+    [repo, "restore failed partway: #{e.message}"]
+  end
+  print_notes(notes)
+
+  if failed
+    die "#{dir} kept, with what is still in it"
+  else
+    FileUtils.rm_rf(dir)
+  end
+end
+
 def cmd_remove(config, args, force)
   die 'remove takes one tree name; see wt --help' unless args.size == 1
 
@@ -823,6 +1000,8 @@ when 'update' then cmd_update(config, args, all)
 when 'update-detached' then cmd_update_detached(config, args, all)
 when 'reset-to-head' then cmd_reset_to_head(config, args, force)
 when 'clean' then cmd_clean(config, args, dry_run)
+when 'archive' then cmd_archive(config, args)
+when 'unarchive' then cmd_unarchive(config, args)
 when 'remove' then cmd_remove(config, args, force)
 when 'prune' then cmd_prune(config, args)
 when 'config' then print File.read(config.path)

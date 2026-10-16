@@ -26,7 +26,9 @@
 #                                   path of every tree, one per line
 #   wt path TREE/REPO            p  the same repo, the way wt list-repos --flat names it
 #   wt path INDEX                p  the tree or repo that number stands for in wt list-repos.
-#                                   A tree named like a number is still that tree
+#                                   A tree named like a number is still that tree.
+#                                   Trees count 1, 2, 3; a repo is its tree's number and its own,
+#                                   so the first repo of tree 1 is 11, the tenth 110
 #   wt repo-paths [TREE]        rp  the repos of a tree, space separated on one line, to
 #                                   hand to something else
 #   wt main-repo-paths         mrp  the main working copies the worktrees are cut from,
@@ -360,15 +362,20 @@ def tree_rows(config, list)
   rows.transform_values { |repos| repos.map { |name, _, head, work, files| [name, head, work, files] } }
 end
 
-# Every tree and every repo in it, numbered from 1 in the order wt list-repos prints them —
-# one count through both, so a number is one thing, and wt path takes it in place of a tree
-# or a tree and a repo. Keyed by [tree, repo], the repo nil for the tree itself. Read off the
-# directories alone, so a number means the same thing wherever the listing was printed from.
+# Every tree and every repo in it, numbered the way wt list-repos prints them: the trees 1, 2, 3
+# and so on, a repo its tree's number followed by its own place in the tree, so the first repo
+# of the first tree is 11, the tenth 110, the first of the second tree 21. wt path takes the
+# number in place of a tree or a tree and a repo. Keyed by [tree, repo], the repo nil for the
+# tree itself. Read off the directories alone, so a number means the same thing wherever the
+# listing was printed from. Past ten trees the numbers can meet (11 is both a tree and the first
+# repo of the first tree); the one listed first wins.
 def numbered(config)
-  entries = trees(config).flat_map do |tree|
-    [[tree, nil, File.join(config.root, tree)], *repo_entries(config, tree).map { |name, path| [tree, name, path] }]
-  end
-  entries.each.with_index(1).to_h { |entry, index| [entry.take(2), [index, entry.last]] }
+  trees(config).each.with_index(1).flat_map do |tree, tree_index|
+    repos = repo_entries(config, tree).each.with_index(1).map do |(name, path), repo_index|
+      [[tree, name], ["#{tree_index}#{repo_index}".to_i, path]]
+    end
+    [[[tree, nil], [tree_index, File.join(config.root, tree)]], *repos]
+  end.to_h
 end
 
 # Each tree, its repos, what each has checked out and whether it has work in it, each tree
@@ -404,7 +411,7 @@ def print_trees(config, list, flat: false, quiet: true)
   index = lambda do |tree, name|
     next '' if flat
 
-    number = numbers.dig([tree, name], 0).to_s.rjust(index_width)
+    number = numbers.dig([tree, name], 0).to_s.ljust(index_width)
     $stdout.tty? ? "\e[2m#{number}#{[tree, name] == here ? "\e[22;1m" : "\e[22m"}  " : "#{number}  "
   end
   indent = flat ? '' : '  '
